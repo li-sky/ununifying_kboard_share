@@ -461,9 +461,21 @@ def receive_control_messages(tls_sock: socket.socket):
     global IS_REMOTE
     buf = ""
     try:
+        tls_sock.settimeout(1.0)
+    except Exception:
+        pass
+    try:
         while True:
-            data = tls_sock.recv(4096)
+            try:
+                data = tls_sock.recv(4096)
+            except socket.timeout:
+                # 心跳读取超时不影响主数据通道，继续等待
+                continue
+            except Exception as exc:
+                print(f"[HB] 读取异常: {exc}")
+                break
             if not data:
+                # 连接真的关闭了
                 break
             buf += data.decode()
             while "\n" in buf:
