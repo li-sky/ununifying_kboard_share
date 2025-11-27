@@ -400,6 +400,9 @@ def tcp_sender_thread():
                     ensure_peer_trust(REMOTE_ID, fingerprint)
                     print(f"[TCP] 已连接 {REMOTE_ID}@{addr}:{port} -> {_format_fingerprint(fingerprint)}")
                     report_ips("connected")
+                    # 发送本端指纹以供对端校验（TOFU）
+                    hello = f"HELLO {LOCAL_ID} {_format_fingerprint(LOCAL_FINGERPRINT)}\n"
+                    tls_sock.sendall(hello.encode())
                     while True:
                         msg = key_queue.get()
                         tls_sock.sendall((msg + "\n").encode())

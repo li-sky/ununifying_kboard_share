@@ -322,15 +322,36 @@ def handle_connection(raw_conn: socket.socket, addr):
         return
 
     try:
+        # 若服务器未请求对端证书，则改用应用层指纹交换
         peer_der = tls_conn.getpeercert(binary_form=True)
-        if not peer_der:
-            raise RuntimeError("对端未提供证书")
-        fingerprint = _compute_fp_from_der(peer_der)
-        ensure_peer_trust(REMOTE_ID, fingerprint)
-        print(f"[TCP] {REMOTE_ID}@{addr} 指纹 {_format_fingerprint(fingerprint)}")
-        report_ips("connected")
+        peer_fp = _compute_fp_from_der(peer_der) if peer_der else None
 
         buffer = ""
+        # 首条消息应为 HELLO
+        while "\n" not in buffer:
+            data = tls_conn.recv(4096)
+            if not data:
+                raise RuntimeError("连接初始化失败：未收到 HELLO")
+            buffer += data.decode()
+        first_line, buffer = buffer.split("\n", 1)
+
+        if first_line.startswith("HELLO "):
+            parts = first_line.split(" ")
+            if len(parts) >= 3:
+                sender_id = parts[1]
+                sender_fp_str = parts[2].replace(":", "").lower()
+                ensure_peer_trust(sender_id, sender_fp_str)
+                print(f"[TCP] 来自 {sender_id}@{addr} 指纹 {_format_fingerprint(sender_fp_str)}")
+            else:
+                raise RuntimeError("HELLO 格式错误")
+        else:
+            raise RuntimeError("未收到 HELLO 指纹交换消息")
+
+        # 如果 TLS 提供了证书，也记录一下（可选）
+        if peer_fp:
+            print(f"[TLS] 对端证书指纹 {_format_fingerprint(peer_fp)}")
+        report_ips("connected")
+
         while True:
             data = tls_conn.recv(4096)
             if not data:
