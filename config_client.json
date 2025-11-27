@@ -1,0 +1,6 @@
+{
+  "local_id": "client-alpha",
+  "remote_id": "host-alpha",
+  "fallback_remote_ips": ["192.168.1.1"],
+  "vps_base_url": "https://your-vps.example.com:8443"
+}
