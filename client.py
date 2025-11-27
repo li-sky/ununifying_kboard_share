@@ -313,6 +313,7 @@ def on_move(x, y):
 
 def inactivity_watcher():
     # 当超过心跳间隔的数倍未检测到鼠标移动时，宣布 INACTIVE
+    global last_move_ts
     threshold = max(HEARTBEAT_INTERVAL * 2.5, 3.0)
     while True:
         time.sleep(0.5)
