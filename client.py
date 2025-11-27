@@ -280,38 +280,53 @@ def get_server_ssl_context() -> ssl.SSLContext:
 
 
 kb = Controller()
-udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 last_heartbeat = 0.0
+last_move_ts = 0.0
+active_conns_lock = threading.Lock()
+active_conns: List[socket.socket] = []
 
 
-def resolve_remote_udp_target():
-    ips, _, udp_port = fetch_remote_descriptor()
-    if not ips:
-        return None
-    return ips[0], udp_port
-
-
-# --- 1. UDP 发送 (鼠标信号) ---
 def send_heartbeat():
     global last_heartbeat
     now = time.time()
     if now - last_heartbeat < HEARTBEAT_INTERVAL:
         return
-    target = resolve_remote_udp_target()
-    if not target:
-        print("[UDP] 尚未获取对端IP，心跳跳过")
-        return
-    try:
-        payload = f"MOUSE_ACTIVE:{LOCAL_ID}".encode("utf-8")
-        udp_sock.sendto(payload, target)
-        print(f"[UDP] 心跳 -> {target[0]}:{target[1]} ({LOCAL_ID})")
+    payload = f"HEARTBEAT ACTIVE {LOCAL_ID}\n".encode("utf-8")
+    sent = 0
+    with active_conns_lock:
+        for conn in list(active_conns):
+            try:
+                conn.sendall(payload)
+                sent += 1
+            except Exception:
+                pass
+    if sent:
+        print(f"[HB] 发送心跳到 {sent} 个连接")
         last_heartbeat = now
-    except OSError as exc:
-        print(f"[UDP] 心跳发送失败: {exc}")
 
 
 def on_move(x, y):
+    global last_move_ts
+    last_move_ts = time.time()
     send_heartbeat()
+
+
+def inactivity_watcher():
+    # 当超过心跳间隔的数倍未检测到鼠标移动时，宣布 INACTIVE
+    threshold = max(HEARTBEAT_INTERVAL * 2.5, 3.0)
+    while True:
+        time.sleep(0.5)
+        idle = time.time() - last_move_ts
+        if idle >= threshold:
+            payload = f"HEARTBEAT INACTIVE {LOCAL_ID}\n".encode("utf-8")
+            with active_conns_lock:
+                for conn in list(active_conns):
+                    try:
+                        conn.sendall(payload)
+                    except Exception:
+                        pass
+            # 重置计时，避免重复发送
+            last_move_ts = time.time()
 
 
 def handle_connection(raw_conn: socket.socket, addr):
@@ -354,6 +369,8 @@ def handle_connection(raw_conn: socket.socket, addr):
         if peer_fp:
             print(f"[TLS] 对端证书指纹 {_format_fingerprint(peer_fp)}")
         report_ips("connected")
+        with active_conns_lock:
+            active_conns.append(tls_conn)
 
         while True:
             data = tls_conn.recv(4096)
@@ -384,6 +401,11 @@ def handle_connection(raw_conn: socket.socket, addr):
         except Exception:
             pass
         tls_conn.close()
+        with active_conns_lock:
+            try:
+                active_conns.remove(tls_conn)
+            except ValueError:
+                pass
         report_ips("disconnect")
         print("[TCP] 等待新的连接...")
 
@@ -413,6 +435,8 @@ if __name__ == '__main__':
     t_tcp.start()
 
     print("Client: 运行中... 按 Ctrl+C 退出")
+    # 启动空闲检测线程
+    threading.Thread(target=inactivity_watcher, daemon=True).start()
     try:
         with mouse.Listener(on_move=on_move) as listener:
             listener.join()

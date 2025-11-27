@@ -404,6 +404,8 @@ def tcp_sender_thread():
                     # 发送本端指纹以供对端校验（TOFU）
                     hello = f"HELLO {LOCAL_ID} {_format_fingerprint(LOCAL_FINGERPRINT)}\n"
                     tls_sock.sendall(hello.encode())
+                    # 启动控制接收线程，处理对端心跳
+                    threading.Thread(target=receive_control_messages, args=(tls_sock,), daemon=True).start()
                     while True:
                         msg = key_queue.get()
                         # 可选：截断长队列以避免阻塞
@@ -439,39 +441,9 @@ def hook_callback(nCode, wParam, lParam):
 # --- 信号监听 ---
 def listen_remote_signal():
     global IS_REMOTE
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.bind(('0.0.0.0', UDP_PORT))
-    print(f"[UDP] 监听本地端口 {UDP_PORT}")
-
+    # UDP 心跳已废弃，改由 TLS 控制消息触发。保留空线程避免主线程阻塞。
     while True:
-        try:
-            data, _ = udp_sock.recvfrom(1024)
-            if not data:
-                continue
-
-            # 兼容旧格式与新格式：
-            # 旧：b'MOUSE_ACTIVE'；新：'MOUSE_ACTIVE:<id>'
-            if data == b'MOUSE_ACTIVE':
-                if not IS_REMOTE:
-                    print("[MODE] 切换到远程模式(legacy heartbeat)")
-                    activate_window()
-                    IS_REMOTE = True
-                continue
-
-            message = data.decode("utf-8", errors="ignore")
-            if message.startswith("MOUSE_ACTIVE"):
-                parts = message.split(":", 1)
-                sender = parts[1] if len(parts) > 1 else ""
-                if sender and sender != REMOTE_ID:
-                    # 来自非预期节点的心跳，忽略
-                    print(f"[UDP] 心跳来源不匹配，期望 {REMOTE_ID} 实际 {sender}")
-                    continue
-                if not IS_REMOTE:
-                    print("[MODE] 切换到远程模式")
-                    activate_window()
-                    IS_REMOTE = True
-        except:
-            pass
+        time.sleep(60)
 
 def on_local_mouse_move(x, y):
     global IS_REMOTE
@@ -483,6 +455,38 @@ def on_local_mouse_move(x, y):
         
         # 2. 最小化 (透明窗口下去，RDP 自动获得焦点)
         minimize_window()
+
+
+def receive_control_messages(tls_sock: socket.socket):
+    global IS_REMOTE
+    buf = ""
+    try:
+        while True:
+            data = tls_sock.recv(4096)
+            if not data:
+                break
+            buf += data.decode()
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                if not line:
+                    continue
+                if line.startswith("HEARTBEAT "):
+                    parts = line.split(" ")
+                    state = parts[1] if len(parts) > 1 else ""
+                    sender = parts[2] if len(parts) > 2 else ""
+                    if sender and sender != REMOTE_ID:
+                        print(f"[HB] 来自未知节点 {sender}，忽略")
+                        continue
+                    if state.upper() == "ACTIVE" and not IS_REMOTE:
+                        print("[MODE] 收到TLS心跳，进入远程模式")
+                        activate_window()
+                        IS_REMOTE = True
+                    elif state.upper() == "INACTIVE" and IS_REMOTE:
+                        print("[MODE] 收到TLS心跳，恢复本地模式")
+                        minimize_window()
+                        IS_REMOTE = False
+    except Exception as exc:
+        print(f"[HB] 控制通道异常: {exc}")
 
 if __name__ == '__main__':
     print_fingerprint_banner()
