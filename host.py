@@ -408,11 +408,6 @@ def tcp_sender_thread():
                     threading.Thread(target=receive_control_messages, args=(tls_sock,), daemon=True).start()
                     while True:
                         msg = key_queue.get()
-                        # 可选：截断长队列以避免阻塞
-                        if len(msg) > 64:
-                            print(f"[TCP] 发送键盘事件: {msg[:64]}...")
-                        else:
-                            print(f"[TCP] 发送键盘事件: {msg}")
                         tls_sock.sendall((msg + "\n").encode())
             except Exception as exc:
                 print(f"[TCP] 连接中断: {exc}")

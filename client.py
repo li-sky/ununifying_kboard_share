@@ -366,10 +366,8 @@ def handle_connection(raw_conn: socket.socket, addr):
                     key = KeyCode.from_vk(vk_code)
                     if action == 'P':
                         kb.press(key)
-                        print(f"[KEY] 按下 VK={vk_code}")
                     elif action == 'R':
                         kb.release(key)
-                        print(f"[KEY] 释放 VK={vk_code}")
                 except Exception:
                     pass
     except Exception as exc:
