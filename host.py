@@ -379,6 +379,7 @@ def tcp_sender_thread():
     ctx = get_client_ssl_context()
     while True:
         ips, port = fetch_remote_descriptor()
+        print(f"[TCP] 目标IP列表: {ips} 端口: {port}")
         if not ips:
             time.sleep(5)
             continue
@@ -405,6 +406,11 @@ def tcp_sender_thread():
                     tls_sock.sendall(hello.encode())
                     while True:
                         msg = key_queue.get()
+                        # 可选：截断长队列以避免阻塞
+                        if len(msg) > 64:
+                            print(f"[TCP] 发送键盘事件: {msg[:64]}...")
+                        else:
+                            print(f"[TCP] 发送键盘事件: {msg}")
                         tls_sock.sendall((msg + "\n").encode())
             except Exception as exc:
                 print(f"[TCP] 连接中断: {exc}")
@@ -435,6 +441,7 @@ def listen_remote_signal():
     global IS_REMOTE
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.bind(('0.0.0.0', UDP_PORT))
+    print(f"[UDP] 监听本地端口 {UDP_PORT}")
 
     while True:
         try:
@@ -442,13 +449,25 @@ def listen_remote_signal():
             if not data:
                 continue
 
+            # 兼容旧格式与新格式：
+            # 旧：b'MOUSE_ACTIVE'；新：'MOUSE_ACTIVE:<id>'
+            if data == b'MOUSE_ACTIVE':
+                if not IS_REMOTE:
+                    print("[MODE] 切换到远程模式(legacy heartbeat)")
+                    activate_window()
+                    IS_REMOTE = True
+                continue
+
             message = data.decode("utf-8", errors="ignore")
             if message.startswith("MOUSE_ACTIVE"):
                 parts = message.split(":", 1)
                 sender = parts[1] if len(parts) > 1 else ""
                 if sender and sender != REMOTE_ID:
+                    # 来自非预期节点的心跳，忽略
+                    print(f"[UDP] 心跳来源不匹配，期望 {REMOTE_ID} 实际 {sender}")
                     continue
                 if not IS_REMOTE:
+                    print("[MODE] 切换到远程模式")
                     activate_window()
                     IS_REMOTE = True
         except:
@@ -458,6 +477,7 @@ def on_local_mouse_move(x, y):
     global IS_REMOTE
     if IS_REMOTE:
         IS_REMOTE = False
+        print("[MODE] 切回本地模式，清空待发送队列")
         with key_queue.mutex:
             key_queue.queue.clear()
         
@@ -467,6 +487,7 @@ def on_local_mouse_move(x, y):
 if __name__ == '__main__':
     print_fingerprint_banner()
     report_ips("startup")
+    print(f"[CONF] 本机ID: {LOCAL_ID} 对端ID: {REMOTE_ID} TCP:{TCP_PORT} UDP:{UDP_PORT}")
 
     # 启动时先变透明
     set_window_transparent()

@@ -299,10 +299,12 @@ def send_heartbeat():
         return
     target = resolve_remote_udp_target()
     if not target:
+        print("[UDP] 尚未获取对端IP，心跳跳过")
         return
     try:
         payload = f"MOUSE_ACTIVE:{LOCAL_ID}".encode("utf-8")
         udp_sock.sendto(payload, target)
+        print(f"[UDP] 心跳 -> {target[0]}:{target[1]} ({LOCAL_ID})")
         last_heartbeat = now
     except OSError as exc:
         print(f"[UDP] 心跳发送失败: {exc}")
@@ -322,6 +324,7 @@ def handle_connection(raw_conn: socket.socket, addr):
         return
 
     try:
+        print(f"[TCP] 入站连接: {addr}")
         # 若服务器未请求对端证书，则改用应用层指纹交换
         peer_der = tls_conn.getpeercert(binary_form=True)
         peer_fp = _compute_fp_from_der(peer_der) if peer_der else None
@@ -341,7 +344,7 @@ def handle_connection(raw_conn: socket.socket, addr):
                 sender_id = parts[1]
                 sender_fp_str = parts[2].replace(":", "").lower()
                 ensure_peer_trust(sender_id, sender_fp_str)
-                print(f"[TCP] 来自 {sender_id}@{addr} 指纹 {_format_fingerprint(sender_fp_str)}")
+                print(f"[TCP] 指纹确认: {sender_id} -> {_format_fingerprint(sender_fp_str)}")
             else:
                 raise RuntimeError("HELLO 格式错误")
         else:
@@ -367,8 +370,10 @@ def handle_connection(raw_conn: socket.socket, addr):
                     key = KeyCode.from_vk(vk_code)
                     if action == 'P':
                         kb.press(key)
+                        print(f"[KEY] 按下 VK={vk_code}")
                     elif action == 'R':
                         kb.release(key)
+                        print(f"[KEY] 释放 VK={vk_code}")
                 except Exception:
                     pass
     except Exception as exc:
@@ -389,7 +394,8 @@ def tcp_server():
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind(('0.0.0.0', TCP_PORT))
     server_sock.listen(2)
-    print(f"Client: TLS 服务监听 {TCP_PORT} ...")
+    print(f"[CONF] 本机ID: {LOCAL_ID} 对端ID: {REMOTE_ID}")
+    print(f"[TCP] TLS 服务监听 {TCP_PORT} ...")
 
     while True:
         conn, addr = server_sock.accept()
