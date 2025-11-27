@@ -272,7 +272,8 @@ def get_server_ssl_context() -> ssl.SSLContext:
         if _server_ssl_context is None:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            ctx.verify_mode = ssl.CERT_OPTIONAL
+            # 使用 TOFU 指纹校验，不做 CA 验证
+            ctx.verify_mode = ssl.CERT_NONE
             ctx.load_cert_chain(certfile=str(CERT_FILE), keyfile=str(KEY_FILE))
             _server_ssl_context = ctx
         return _server_ssl_context
