@@ -11,8 +11,22 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib import request
 
-from pynput import mouse
-from pynput.keyboard import Controller, KeyCode
+IS_WINDOWS = platform.system().lower() == "windows"
+
+if IS_WINDOWS:
+    from pynput import mouse
+    from pynput.keyboard import Controller, Key, KeyCode
+else:
+    mouse = None
+    Controller = None
+    Key = None
+    KeyCode = None
+    try:
+        from linux_input import EvdevMouseWatcher, UInputKeyboardInjector, find_mice
+    except Exception:
+        EvdevMouseWatcher = None
+        UInputKeyboardInjector = None
+        find_mice = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -48,6 +62,7 @@ DEFAULT_CONFIG = {
     "ip_report_interval": 300,
     "remote_refresh_interval": 30,
     "heartbeat_interval": 2.0,
+    "linux_mouse_devices": None,
 }
 
 
@@ -285,6 +300,100 @@ active_conns_lock = threading.Lock()
 active_conns: List[socket.socket] = []
 
 
+def _inject_windows(action: str, payload: str):
+    # payload can be VK int string or Linux-style KEY_* name.
+    if Controller is None:
+        return
+
+    try:
+        if payload.isdigit():
+            vk_code = int(payload)
+            key = KeyCode.from_vk(vk_code)
+            if action == "P":
+                kb.press(key)
+            elif action == "R":
+                kb.release(key)
+            return
+    except Exception:
+        pass
+
+    key_name = payload
+    if not isinstance(key_name, str) or not key_name.startswith("KEY_"):
+        return
+
+    # Minimal mapping for common keys.
+    special_map = {
+        "KEY_SPACE": Key.space if Key else None,
+        "KEY_ENTER": Key.enter if Key else None,
+        "KEY_TAB": Key.tab if Key else None,
+        "KEY_BACKSPACE": Key.backspace if Key else None,
+        "KEY_ESC": Key.esc if Key else None,
+        "KEY_LEFTCTRL": Key.ctrl_l if Key else None,
+        "KEY_RIGHTCTRL": Key.ctrl_r if Key else None,
+        "KEY_LEFTSHIFT": Key.shift_l if Key else None,
+        "KEY_RIGHTSHIFT": Key.shift_r if Key else None,
+        "KEY_LEFTALT": Key.alt_l if Key else None,
+        "KEY_RIGHTALT": Key.alt_r if Key else None,
+        "KEY_CAPSLOCK": Key.caps_lock if Key else None,
+        "KEY_UP": Key.up if Key else None,
+        "KEY_DOWN": Key.down if Key else None,
+        "KEY_LEFT": Key.left if Key else None,
+        "KEY_RIGHT": Key.right if Key else None,
+        "KEY_HOME": Key.home if Key else None,
+        "KEY_END": Key.end if Key else None,
+        "KEY_PAGEUP": Key.page_up if Key else None,
+        "KEY_PAGEDOWN": Key.page_down if Key else None,
+        "KEY_DELETE": Key.delete if Key else None,
+        "KEY_INSERT": Key.insert if Key else None,
+    }
+
+    mapped = special_map.get(key_name)
+    if mapped is not None:
+        if action == "P":
+            kb.press(mapped)
+        elif action == "R":
+            kb.release(mapped)
+        return
+
+    # KEY_A..KEY_Z
+    if len(key_name) == 5 and key_name.startswith("KEY_"):
+        ch = key_name[-1]
+        if "A" <= ch <= "Z" and KeyCode is not None:
+            key = KeyCode.from_char(ch.lower())
+            if action == "P":
+                kb.press(key)
+            elif action == "R":
+                kb.release(key)
+            return
+
+    # KEY_0..KEY_9
+    if len(key_name) == 5 and key_name.startswith("KEY_"):
+        ch = key_name[-1]
+        if "0" <= ch <= "9" and KeyCode is not None:
+            key = KeyCode.from_char(ch)
+            if action == "P":
+                kb.press(key)
+            elif action == "R":
+                kb.release(key)
+
+
+def _inject_linux(injector: "UInputKeyboardInjector", action: str, payload: str):
+    if injector is None:
+        return
+    if not isinstance(payload, str):
+        return
+
+    if payload.isdigit():
+        # Windows VK code cannot be used on Linux reliably.
+        return
+
+    key_name = payload
+    if action == "P":
+        injector.press_key_name(key_name)
+    elif action == "R":
+        injector.release_key_name(key_name)
+
+
 def send_heartbeat():
     global last_heartbeat
     now = time.time()
@@ -351,6 +460,12 @@ def handle_connection(raw_conn: socket.socket, addr):
         with active_conns_lock:
             active_conns.append(tls_conn)
 
+        injector = None
+        if not IS_WINDOWS:
+            if UInputKeyboardInjector is None:
+                raise RuntimeError("Linux 模式需要 evdev/uinput：请安装 `pip install evdev` 并确保可访问 /dev/uinput")
+            injector = UInputKeyboardInjector()
+
         while True:
             data = tls_conn.recv(4096)
             if not data:
@@ -361,13 +476,13 @@ def handle_connection(raw_conn: socket.socket, addr):
                 if not msg:
                     continue
                 try:
-                    action, code_str = msg.split(':')
-                    vk_code = int(code_str)
-                    key = KeyCode.from_vk(vk_code)
-                    if action == 'P':
-                        kb.press(key)
-                    elif action == 'R':
-                        kb.release(key)
+                    action, payload = msg.split(':', 1)
+                    action = action.strip().upper()
+                    payload = payload.strip()
+                    if IS_WINDOWS:
+                        _inject_windows(action, payload)
+                    else:
+                        _inject_linux(injector, action, payload)
                 except Exception:
                     pass
     except Exception as exc:
@@ -413,8 +528,24 @@ if __name__ == '__main__':
 
     print("Client: 运行中... 按 Ctrl+C 退出")
     try:
-        with mouse.Listener(on_move=on_move) as listener:
-            listener.join()
+        if IS_WINDOWS:
+            with mouse.Listener(on_move=on_move) as listener:
+                listener.join()
+        else:
+            mouse_paths = CONFIG.get("linux_mouse_devices")
+            if mouse_paths and not isinstance(mouse_paths, list):
+                mouse_paths = None
+
+            if EvdevMouseWatcher is None or find_mice is None:
+                raise RuntimeError("Linux 模式需要 evdev：请安装 `pip install evdev`")
+
+            mice = find_mice(mouse_paths)
+            if not mice:
+                raise RuntimeError("未找到鼠标设备。可在 config_client.json 设置 linux_mouse_devices: [\"/dev/input/eventX\"]")
+
+            EvdevMouseWatcher(mice, on_activity=send_heartbeat).start()
+            while True:
+                time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:

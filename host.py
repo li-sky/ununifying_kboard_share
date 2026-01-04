@@ -1,8 +1,6 @@
-import sys
 import time
 import socket
 import threading
-import ctypes
 import queue
 import json
 import ssl
@@ -11,10 +9,26 @@ import subprocess
 import platform
 import re
 from pathlib import Path
-from ctypes import wintypes, c_void_p, c_int, c_longlong, c_uint, POINTER, WINFUNCTYPE, cast, byref
 from typing import Dict, List, Tuple
 from urllib import request
-from pynput import mouse
+
+IS_WINDOWS = platform.system().lower() == "windows"
+
+if IS_WINDOWS:
+    import ctypes
+    from ctypes import wintypes, c_void_p, c_int, c_longlong, c_uint, POINTER, WINFUNCTYPE, cast, byref
+
+    from pynput import mouse
+else:
+    mouse = None
+
+    try:
+        from linux_input import EvdevKeyboardCapture, EvdevMouseWatcher, find_keyboards, find_mice
+    except Exception:
+        EvdevKeyboardCapture = None
+        EvdevMouseWatcher = None
+        find_keyboards = None
+        find_mice = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -49,6 +63,8 @@ DEFAULT_CONFIG = {
     "ip_report_interval": 300,
     "remote_refresh_interval": 30,
     "fallback_remote_ips": [],
+    "linux_keyboard_devices": None,
+    "linux_mouse_devices": None,
 }
 
 
@@ -281,56 +297,92 @@ IS_REMOTE = False
 key_queue = queue.Queue()
 
 
-# --- Windows API ---
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
+def set_remote_mode(enabled: bool):
+    global IS_REMOTE
+    if enabled == IS_REMOTE:
+        return
 
-LRESULT = c_longlong
-HHOOK = c_void_p
-HOOKPROC = WINFUNCTYPE(LRESULT, c_int, wintypes.WPARAM, c_void_p)
-WH_KEYBOARD_LL = 13
-WM_KEYDOWN = 0x0100
-WM_SYSKEYDOWN = 0x0104
+    if not enabled:
+        print("[MODE] 切回本地模式，清空待发送队列")
+        with key_queue.mutex:
+            key_queue.queue.clear()
+        minimize_window()
+    else:
+        print("[MODE] 进入远程模式")
+        activate_window()
 
-# 窗口常量
-GWL_EXSTYLE = -20
-WS_EX_LAYERED = 0x80000
-LWA_ALPHA = 0x2
-SW_HIDE = 0
-SW_SHOWNORMAL = 1
-SW_SHOWMINIMIZED = 2
-SW_SHOW = 5
-SW_MINIMIZE = 6
-SW_RESTORE = 9
+    IS_REMOTE = enabled
+    _apply_linux_grab_state()
 
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
-                ("flags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", c_void_p)]
 
-# API 定义
-user32.SetWindowsHookExA.argtypes = [c_int, HOOKPROC, c_void_p, c_int]
-user32.SetWindowsHookExA.restype = HHOOK
-user32.CallNextHookEx.argtypes = [HHOOK, c_int, wintypes.WPARAM, c_void_p]
-user32.CallNextHookEx.restype = LRESULT
-user32.GetMessageA.argtypes = [POINTER(wintypes.MSG), c_void_p, c_int, c_int]
-kernel32.GetModuleHandleW.restype = c_void_p
+_linux_capture = None
 
-kernel32.GetConsoleWindow.restype = c_void_p
-user32.GetForegroundWindow.restype = c_void_p
-user32.GetWindowThreadProcessId.argtypes = [c_void_p, POINTER(c_uint)]
-user32.GetWindowThreadProcessId.restype = c_uint
-kernel32.GetCurrentThreadId.restype = c_uint
-user32.AttachThreadInput.argtypes = [c_uint, c_uint, c_int]
-user32.SetForegroundWindow.argtypes = [c_void_p]
-user32.SetForegroundWindow.restype = c_int
-user32.ShowWindow.argtypes = [c_void_p, c_int]
-user32.IsIconic.argtypes = [c_void_p]
-user32.SetWindowLongW.argtypes = [c_void_p, c_int, c_longlong]
-user32.GetWindowLongW.argtypes = [c_void_p, c_int]
-user32.SetLayeredWindowAttributes.argtypes = [c_void_p, c_int, c_int, c_int]
+
+def _apply_linux_grab_state():
+    if IS_WINDOWS:
+        return
+    global _linux_capture
+    if _linux_capture is None:
+        return
+    try:
+        _linux_capture.set_grabbed(IS_REMOTE)
+    except Exception:
+        pass
+
+
+if IS_WINDOWS:
+    # --- Windows API ---
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    LRESULT = c_longlong
+    HHOOK = c_void_p
+    HOOKPROC = WINFUNCTYPE(LRESULT, c_int, wintypes.WPARAM, c_void_p)
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN = 0x0100
+    WM_SYSKEYDOWN = 0x0104
+
+    # 窗口常量
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED = 0x80000
+    LWA_ALPHA = 0x2
+    SW_HIDE = 0
+    SW_SHOWNORMAL = 1
+    SW_SHOWMINIMIZED = 2
+    SW_SHOW = 5
+    SW_MINIMIZE = 6
+    SW_RESTORE = 9
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", c_void_p)]
+
+    # API 定义
+    user32.SetWindowsHookExA.argtypes = [c_int, HOOKPROC, c_void_p, c_int]
+    user32.SetWindowsHookExA.restype = HHOOK
+    user32.CallNextHookEx.argtypes = [HHOOK, c_int, wintypes.WPARAM, c_void_p]
+    user32.CallNextHookEx.restype = LRESULT
+    user32.GetMessageA.argtypes = [POINTER(wintypes.MSG), c_void_p, c_int, c_int]
+    kernel32.GetModuleHandleW.restype = c_void_p
+
+    kernel32.GetConsoleWindow.restype = c_void_p
+    user32.GetForegroundWindow.restype = c_void_p
+    user32.GetWindowThreadProcessId.argtypes = [c_void_p, POINTER(c_uint)]
+    user32.GetWindowThreadProcessId.restype = c_uint
+    kernel32.GetCurrentThreadId.restype = c_uint
+    user32.AttachThreadInput.argtypes = [c_uint, c_uint, c_int]
+    user32.SetForegroundWindow.argtypes = [c_void_p]
+    user32.SetForegroundWindow.restype = c_int
+    user32.ShowWindow.argtypes = [c_void_p, c_int]
+    user32.IsIconic.argtypes = [c_void_p]
+    user32.SetWindowLongW.argtypes = [c_void_p, c_int, c_longlong]
+    user32.GetWindowLongW.argtypes = [c_void_p, c_int]
+    user32.SetLayeredWindowAttributes.argtypes = [c_void_p, c_int, c_int, c_int]
 
 def set_window_transparent():
-    """初始化：将窗口设为透明"""
+    """初始化：将窗口设为透明（Windows），Linux 下为 no-op。"""
+    if not IS_WINDOWS:
+        return
     hwnd = kernel32.GetConsoleWindow()
     if hwnd:
         style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
@@ -338,13 +390,17 @@ def set_window_transparent():
         user32.SetLayeredWindowAttributes(hwnd, 0, WINDOW_ALPHA, LWA_ALPHA)
 
 def activate_window():
-    """【切入远程模式】还原窗口并抢焦点"""
+    """【切入远程模式】Windows 下还原窗口并抢焦点；Linux 下为 no-op。"""
+    if not IS_WINDOWS:
+        return
     try:
         my_hwnd = kernel32.GetConsoleWindow()
-        if not my_hwnd: return
-        
+        if not my_hwnd:
+            return
+
         curr_hwnd = user32.GetForegroundWindow()
-        if my_hwnd == curr_hwnd: return
+        if my_hwnd == curr_hwnd:
+            return
 
         my_tid = kernel32.GetCurrentThreadId()
         curr_tid = user32.GetWindowThreadProcessId(curr_hwnd, None)
@@ -353,25 +409,24 @@ def activate_window():
         if curr_tid != my_tid:
             user32.AttachThreadInput(curr_tid, my_tid, True)
             detached = True
-        
-        # 还原并置顶
+
         user32.ShowWindow(my_hwnd, SW_RESTORE)
         user32.SetForegroundWindow(my_hwnd)
-        
+
         if detached:
             user32.AttachThreadInput(curr_tid, my_tid, False)
-            
-    except:
+    except Exception:
         pass
 
 def minimize_window():
-    """【切回本地模式】最小化窗口，将焦点交还给 RDP"""
+    """【切回本地模式】Windows 下最小化；Linux 下为 no-op。"""
+    if not IS_WINDOWS:
+        return
     try:
         hwnd = kernel32.GetConsoleWindow()
         if hwnd:
-            # 最小化后，Windows 会自动把焦点给 Z-Order 里的下一个窗口 (即 RDP)
             user32.ShowWindow(hwnd, SW_MINIMIZE)
-    except:
+    except Exception:
         pass
 
 # --- TCP 发送 ---
@@ -441,15 +496,13 @@ def listen_remote_signal():
         time.sleep(60)
 
 def on_local_mouse_move(x, y):
-    global IS_REMOTE
     if IS_REMOTE:
-        IS_REMOTE = False
-        print("[MODE] 切回本地模式，清空待发送队列")
-        with key_queue.mutex:
-            key_queue.queue.clear()
-        
-        # 2. 最小化 (透明窗口下去，RDP 自动获得焦点)
-        minimize_window()
+        set_remote_mode(False)
+
+
+def on_linux_local_activity():
+    if IS_REMOTE:
+        set_remote_mode(False)
 
 
 def receive_control_messages(tls_sock: socket.socket):
@@ -459,8 +512,8 @@ def receive_control_messages(tls_sock: socket.socket):
         tls_sock.settimeout(1.0)
     except Exception:
         pass
-    try:
-        while True:
+    while True:
+        try:
             try:
                 data = tls_sock.recv(4096)
             except socket.timeout:
@@ -486,14 +539,12 @@ def receive_control_messages(tls_sock: socket.socket):
                         continue
                     if state.upper() == "ACTIVE" and not IS_REMOTE:
                         print("[MODE] 收到TLS心跳，进入远程模式")
-                        activate_window()
-                        IS_REMOTE = True
+                        set_remote_mode(True)
                     elif state.upper() == "INACTIVE" and IS_REMOTE:
                         print("[MODE] 收到TLS心跳，恢复本地模式")
-                        minimize_window()
-                        IS_REMOTE = False
-    except Exception as exc:
-        print(f"[HB] 控制通道异常: {exc}")
+                        set_remote_mode(False)
+        except Exception as exc:
+            print(f"[HB] 控制通道异常: {exc}")
 
 if __name__ == '__main__':
     print_fingerprint_banner()
@@ -515,19 +566,61 @@ if __name__ == '__main__':
     t_udp = threading.Thread(target=listen_remote_signal, daemon=True)
     t_udp.start()
 
-    m_listener = mouse.Listener(on_move=on_local_mouse_move)
-    m_listener.start()
-    
-    try:
-        cb = HOOKPROC(hook_callback)
-        h_mod = kernel32.GetModuleHandleW(None)
-        hook_id = user32.SetWindowsHookExA(WH_KEYBOARD_LL, cb, h_mod, 0)
-        
-        msg = wintypes.MSG()
-        while user32.GetMessageA(byref(msg), None, 0, 0) != 0:
-            user32.TranslateMessage(byref(msg))
-            user32.DispatchMessageA(byref(msg))
-    except KeyboardInterrupt:
-        pass
-    finally:
-        report_ips("shutdown")
+    if IS_WINDOWS:
+        m_listener = mouse.Listener(on_move=on_local_mouse_move)
+        m_listener.start()
+
+        try:
+            cb = HOOKPROC(hook_callback)
+            h_mod = kernel32.GetModuleHandleW(None)
+            hook_id = user32.SetWindowsHookExA(WH_KEYBOARD_LL, cb, h_mod, 0)
+
+            msg = wintypes.MSG()
+            while user32.GetMessageA(byref(msg), None, 0, 0) != 0:
+                user32.TranslateMessage(byref(msg))
+                user32.DispatchMessageA(byref(msg))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            report_ips("shutdown")
+    else:
+        # Linux/Wayland (KDE): use evdev to capture keyboard and mouse activity.
+        keyboard_paths = CONFIG.get("linux_keyboard_devices")
+        mouse_paths = CONFIG.get("linux_mouse_devices")
+        if keyboard_paths and not isinstance(keyboard_paths, list):
+            keyboard_paths = None
+        if mouse_paths and not isinstance(mouse_paths, list):
+            mouse_paths = None
+
+        if EvdevKeyboardCapture is None or find_keyboards is None:
+            raise RuntimeError("Linux 模式需要 evdev：请安装 `pip install evdev`")
+
+        kb_devices = find_keyboards(keyboard_paths)
+        if not kb_devices:
+            raise RuntimeError("未找到键盘设备。可在 config_host.json 设置 linux_keyboard_devices: [\"/dev/input/eventX\"]")
+
+        def on_key(action: str, key_name: str):
+            # Only forward in remote mode.
+            if not IS_REMOTE:
+                return
+            key_queue.put(f"{action}:{key_name}")
+
+        _linux_capture = EvdevKeyboardCapture(kb_devices, on_key=on_key)
+        _linux_capture.start()
+
+        mice = []
+        if find_mice is not None:
+            mice = find_mice(mouse_paths)
+        if mice and EvdevMouseWatcher is not None:
+            EvdevMouseWatcher(mice, on_activity=on_linux_local_activity).start()
+        else:
+            print("[WARN] 未启用 Linux 鼠标活动监听：无法自动切回本地模式（可在配置中指定 linux_mouse_devices 或检查权限）。")
+
+        print("Host(Linux): 运行中... 按 Ctrl+C 退出")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            report_ips("shutdown")

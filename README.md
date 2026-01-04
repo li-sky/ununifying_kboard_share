@@ -181,7 +181,9 @@ sudo systemctl status kb-registry
 
 ## 快速开始
 
-1. 安装依赖：`pip install pynput`，并确保系统 `PATH` 中有 OpenSSL。
+1. 安装依赖，并确保系统 `PATH` 中有 OpenSSL。
+  - Windows: `pip install pynput`
+  - Linux (Wayland/KDE 推荐): `pip install evdev`
 2. 按需编辑最小配置 JSON（或删除以生成默认模板）。
 3. 启动注册表服务（动态 IP 环境建议启用）。
 4. 先启动 `client.py`（开始监听与上报）。
@@ -191,6 +193,32 @@ sudo systemctl status kb-registry
   - 首次连接时询问是否信任新指纹。
 6. 在客户端机器移动鼠标：其会发送 `MOUSE_ACTIVE:<id>` 心跳，主机提升透明窗口并开始安全发送键盘事件。
 7. 在主机本地移动鼠标：恢复本地模式，主机最小化并停止发送按键。
+
+## Linux / Wayland (KDE) 说明
+
+Wayland 通常不允许应用在“系统范围”直接抓取/注入输入事件（出于安全原因）。本项目在 Linux 下使用内核输入接口：
+
+- 捕获：读取 `/dev/input/event*`（evdev）
+- 注入：写入 `/dev/uinput`（uinput，创建虚拟键盘）
+
+因此需要额外权限：
+
+- 运行用户需能读 `/dev/input/event*`（通常加入 `input` 组）
+- 运行用户需能访问 `/dev/uinput`（不同发行版规则不同；常见为 `input` 组或 `uinput` 组）
+
+示例（以 Debian/Ubuntu/KDE 为例，按你的发行版调整）：
+
+```bash
+sudo usermod -aG input $USER
+sudo modprobe uinput
+```
+
+然后注销/重登使组权限生效。
+
+如自动发现不到设备，可在配置里显式指定设备路径：
+
+- `config_host.json`: `linux_keyboard_devices: ["/dev/input/eventX"]` / `linux_mouse_devices: ["/dev/input/eventY"]`
+- `config_client.json`: `linux_mouse_devices: ["/dev/input/eventY"]`
 
 ## 运行注意
 
