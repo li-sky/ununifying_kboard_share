@@ -52,6 +52,8 @@
 - `trust_store`：信任库路径。
 - `vps_ca_cert` 或 `allow_insecure_vps`：注册表 TLS 校验策略。
 - `ip_report_interval`、`remote_refresh_interval`、`heartbeat_interval`：网络上报与刷新频率。
+- `auto_trust_first_seen`：`true` 时，首次看到新指纹自动信任（适合无控制台后台运行，安全性低于人工确认）。
+- `require_interactive_trust`：默认为 `true`。在有控制台时要求人工输入 `yes/no`。若需纯后台启动，可设为 `false` 并配合 `auto_trust_first_seen`。
 
 删除配置文件可重新生成带默认值的最小模板。
 
@@ -181,9 +183,7 @@ sudo systemctl status kb-registry
 
 ## 快速开始
 
-1. 安装依赖，并确保系统 `PATH` 中有 OpenSSL。
-  - Windows: `pip install pynput`
-  - Linux (Wayland/KDE 推荐): `pip install evdev`
+1. 安装依赖：`pip install pynput pystray pillow`，并确保系统 `PATH` 中有 OpenSSL。
 2. 按需编辑最小配置 JSON（或删除以生成默认模板）。
 3. 启动注册表服务（动态 IP 环境建议启用）。
 4. 先启动 `client.py`（开始监听与上报）。
@@ -237,3 +237,56 @@ sudo modprobe uinput
 | 收不到键盘事件 | UDP 心跳未到主机 | 检查 `remote_udp_port`/`udp_port`、防火墙规则，并确认客户端能解析主机 IP（通过注册表或备用 IP）。 |
 
 本项目尽量使用内置库（`ssl`、`urllib`）以减少依赖，按需调整配置与注册表以适配你的环境。
+
+## Windows 体验优化（托盘常驻 / 开机自启 / 无黑框）
+
+本仓库已提供托盘守护与自启动脚本：
+
+- `tray_runner.py`：系统托盘守护器，可启动/停止/重启 `host.py` 或 `client.py`。
+- `start_tray.ps1`：主启动器。优先使用项目内 `.venv\Scripts\pythonw.exe`，不存在时再回退到系统 Python，并以隐藏窗口方式拉起托盘。
+- `starthost.cmd` / `startclient.cmd`：兼容双击入口，内部调用 PowerShell 隐藏启动 `start_tray.ps1`。
+- `configure_autostart.ps1`：为当前用户注册或移除开机自启（写入启动文件夹快捷方式，直接指向 PowerShell 启动器）。
+
+托盘菜单支持：
+- 查看当前状态（运行中/已停止）。
+- 启动、停止、重启服务。
+- 打开项目目录与日志目录（`logs/`）。
+- 退出托盘（退出时会先停止子进程）。
+
+托盘还带有单实例保护：同一台机器上，`host` 托盘和 `client` 托盘各自只允许启动一个实例；重复双击启动脚本会直接忽略，不会堆出多个托盘图标。
+
+### 1) 先完成首次信任（推荐）
+
+首次连接建议先在前台运行一次 `python host.py` 和 `python client.py`，手动确认指纹后再切换托盘常驻。
+
+### 2) 配置后台无交互模式（可选）
+
+若你希望首次连接也不弹控制台，可在两端配置中加入：
+
+```json
+{
+  "require_interactive_trust": false,
+  "auto_trust_first_seen": true
+}
+```
+
+> [!WARNING]
+> 该配置会自动信任首次见到的指纹，存在被中间人欺骗的风险。更安全的方式是先前台手动确认一次，再后台运行。
+
+### 3) 启用开机自启
+
+在项目目录执行（PowerShell）：
+
+```powershell
+# 主机端
+powershell -ExecutionPolicy Bypass -File .\configure_autostart.ps1 -Role host
+
+# 客户端
+powershell -ExecutionPolicy Bypass -File .\configure_autostart.ps1 -Role client
+```
+
+移除自启动：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\configure_autostart.ps1 -Role host -Disable
+```

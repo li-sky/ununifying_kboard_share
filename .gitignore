@@ -1,3 +1,4 @@
 *.json
 certs/
 __pycache__/
+logs/

@@ -63,6 +63,8 @@ DEFAULT_CONFIG = {
     "ip_report_interval": 300,
     "remote_refresh_interval": 30,
     "fallback_remote_ips": [],
+    "auto_trust_first_seen": False,
+    "require_interactive_trust": True,
     "linux_keyboard_devices": None,
     "linux_mouse_devices": None,
 }
@@ -95,6 +97,8 @@ ALLOW_INSECURE_VPS = bool(CONFIG.get("allow_insecure_vps", False))
 IP_REPORT_INTERVAL = max(60, int(CONFIG.get("ip_report_interval", 300)))
 REMOTE_REFRESH_INTERVAL = max(5, int(CONFIG.get("remote_refresh_interval", 30)))
 FALLBACK_REMOTE_IPS = CONFIG.get("fallback_remote_ips", [])
+AUTO_TRUST_FIRST_SEEN = bool(CONFIG.get("auto_trust_first_seen", False))
+REQUIRE_INTERACTIVE_TRUST = bool(CONFIG.get("require_interactive_trust", True))
 
 
 def ensure_certificates():
@@ -184,9 +188,17 @@ def ensure_peer_trust(peer_id: str, fingerprint: str):
             raise RuntimeError(f"指纹不匹配: {peer_id} -> {formatted}")
         if not known:
             print(f"[SECURE] 检测到新的指纹 {peer_id}: {formatted}")
-            answer = input("是否信任该指纹? (yes/no): ").strip().lower()
-            if answer not in {"y", "yes"}:
-                raise RuntimeError("用户拒绝指纹，终止连接。")
+            interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+            if interactive and REQUIRE_INTERACTIVE_TRUST:
+                answer = input("是否信任该指纹? (yes/no): ").strip().lower()
+                if answer not in {"y", "yes"}:
+                    raise RuntimeError("用户拒绝指纹，终止连接。")
+            elif AUTO_TRUST_FIRST_SEEN:
+                print("[SECURE] 已启用 auto_trust_first_seen，自动信任新指纹。")
+            else:
+                raise RuntimeError(
+                    "首次连接需要人工确认指纹。请先前台运行一次，或在配置中设置 auto_trust_first_seen=true。"
+                )
             trust_store[peer_id] = fingerprint
             save_trust_store()
             print(f"[SECURE] 已信任 {peer_id}。")
@@ -459,11 +471,26 @@ def tcp_sender_thread():
                     # 发送本端指纹以供对端校验（TOFU）
                     hello = f"HELLO {LOCAL_ID} {_format_fingerprint(LOCAL_FINGERPRINT)}\n"
                     tls_sock.sendall(hello.encode())
-                    # 启动控制接收线程，处理对端心跳
-                    threading.Thread(target=receive_control_messages, args=(tls_sock,), daemon=True).start()
-                    while True:
-                        msg = key_queue.get()
-                        tls_sock.sendall((msg + "\n").encode())
+
+                    # 使用事件让控制线程和发送线程协同退出，避免连接被远端关闭后一直阻塞
+                    stop_event = threading.Event()
+                    threading.Thread(
+                        target=receive_control_messages,
+                        args=(tls_sock, stop_event),
+                        daemon=True,
+                    ).start()
+
+                    while not stop_event.is_set():
+                        try:
+                            msg = key_queue.get(timeout=1)
+                        except queue.Empty:
+                            continue
+                        try:
+                            tls_sock.sendall((msg + "\n").encode())
+                        except Exception as exc:
+                            print(f"[TCP] 发送失败: {exc}")
+                            stop_event.set()
+                            break
             except Exception as exc:
                 print(f"[TCP] 连接中断: {exc}")
                 report_ips("disconnect")
@@ -505,7 +532,7 @@ def on_linux_local_activity():
         set_remote_mode(False)
 
 
-def receive_control_messages(tls_sock: socket.socket):
+def receive_control_messages(tls_sock: socket.socket, stop_event: threading.Event):
     global IS_REMOTE
     buf = ""
     try:
@@ -521,9 +548,11 @@ def receive_control_messages(tls_sock: socket.socket):
                 continue
             except Exception as exc:
                 print(f"[HB] 读取异常: {exc}")
+                stop_event.set()
                 break
             if not data:
                 # 连接真的关闭了
+                stop_event.set()
                 break
             buf += data.decode()
             while "\n" in buf:
@@ -542,9 +571,21 @@ def receive_control_messages(tls_sock: socket.socket):
                         set_remote_mode(True)
                     elif state.upper() == "INACTIVE" and IS_REMOTE:
                         print("[MODE] 收到TLS心跳，恢复本地模式")
-                        set_remote_mode(False)
+                        minimize_window()
+                        IS_REMOTE = False
         except Exception as exc:
             print(f"[HB] 控制通道异常: {exc}")
+            stop_event.set()
+            break
+
+    try:
+        tls_sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        tls_sock.close()
+    except Exception:
+        pass
 
 if __name__ == '__main__':
     print_fingerprint_banner()

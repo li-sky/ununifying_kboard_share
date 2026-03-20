@@ -2,6 +2,7 @@ import json
 import re
 import socket
 import ssl
+import sys
 import threading
 import time
 import platform
@@ -62,6 +63,8 @@ DEFAULT_CONFIG = {
     "ip_report_interval": 300,
     "remote_refresh_interval": 30,
     "heartbeat_interval": 2.0,
+    "auto_trust_first_seen": False,
+    "require_interactive_trust": True,
     "linux_mouse_devices": None,
 }
 
@@ -94,6 +97,8 @@ ALLOW_INSECURE_VPS = bool(CONFIG.get("allow_insecure_vps", False))
 IP_REPORT_INTERVAL = max(60, int(CONFIG.get("ip_report_interval", 300)))
 REMOTE_REFRESH_INTERVAL = max(5, int(CONFIG.get("remote_refresh_interval", 30)))
 HEARTBEAT_INTERVAL = max(0.2, float(CONFIG.get("heartbeat_interval", 2.0)))
+AUTO_TRUST_FIRST_SEEN = bool(CONFIG.get("auto_trust_first_seen", False))
+REQUIRE_INTERACTIVE_TRUST = bool(CONFIG.get("require_interactive_trust", True))
 
 
 def ensure_certificates():
@@ -182,9 +187,17 @@ def ensure_peer_trust(peer_id: str, fingerprint: str):
             raise RuntimeError(f"指纹不匹配: {peer_id} -> {formatted}")
         if not known:
             print(f"[SECURE] 检测到新的指纹 {peer_id}: {formatted}")
-            answer = input("是否信任该指纹? (yes/no): ").strip().lower()
-            if answer not in {"y", "yes"}:
-                raise RuntimeError("用户拒绝指纹，终止连接。")
+            interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+            if interactive and REQUIRE_INTERACTIVE_TRUST:
+                answer = input("是否信任该指纹? (yes/no): ").strip().lower()
+                if answer not in {"y", "yes"}:
+                    raise RuntimeError("用户拒绝指纹，终止连接。")
+            elif AUTO_TRUST_FIRST_SEEN:
+                print("[SECURE] 已启用 auto_trust_first_seen，自动信任新指纹。")
+            else:
+                raise RuntimeError(
+                    "首次连接需要人工确认指纹。请先前台运行一次，或在配置中设置 auto_trust_first_seen=true。"
+                )
             trust_store[peer_id] = fingerprint
             save_trust_store()
             print(f"[SECURE] 已信任 {peer_id}。")
