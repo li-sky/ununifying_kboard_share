@@ -3,6 +3,7 @@ import socket
 import threading
 import queue
 import json
+import sys
 import ssl
 import hashlib
 import subprocess
@@ -307,6 +308,7 @@ def get_client_ssl_context() -> ssl.SSLContext:
 # 全局变量
 IS_REMOTE = False
 key_queue = queue.Queue()
+last_heartbeat_log = 0.0
 
 
 def set_remote_mode(enabled: bool):
@@ -533,7 +535,7 @@ def on_linux_local_activity():
 
 
 def receive_control_messages(tls_sock: socket.socket, stop_event: threading.Event):
-    global IS_REMOTE
+    global IS_REMOTE, last_heartbeat_log
     buf = ""
     try:
         tls_sock.settimeout(1.0)
@@ -566,13 +568,17 @@ def receive_control_messages(tls_sock: socket.socket, stop_event: threading.Even
                     if sender and sender != REMOTE_ID:
                         print(f"[HB] 来自未知节点 {sender}，忽略")
                         continue
+                    now = time.time()
+                    if now - last_heartbeat_log >= 1.0:
+                        source = sender or "unknown"
+                        print(f"[HB] 收到TLS心跳: {state.upper()} from {source}")
+                        last_heartbeat_log = now
                     if state.upper() == "ACTIVE" and not IS_REMOTE:
                         print("[MODE] 收到TLS心跳，进入远程模式")
                         set_remote_mode(True)
                     elif state.upper() == "INACTIVE" and IS_REMOTE:
                         print("[MODE] 收到TLS心跳，恢复本地模式")
-                        minimize_window()
-                        IS_REMOTE = False
+                        set_remote_mode(False)
         except Exception as exc:
             print(f"[HB] 控制通道异常: {exc}")
             stop_event.set()
