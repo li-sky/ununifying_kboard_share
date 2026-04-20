@@ -315,7 +315,7 @@ def get_server_ssl_context() -> ssl.SSLContext:
 
 
 kb = Controller()
-last_activity_ts = 0.0
+last_activity_ts = time.time()
 last_state_sent_ts = 0.0
 last_sent_state = "INACTIVE"
 last_activity_log_ts = 0.0
@@ -426,6 +426,7 @@ def mark_local_activity():
     if now - last_activity_log_ts >= ACTIVITY_LOG_INTERVAL:
         print("[HB] 检测到鼠标活动")
         last_activity_log_ts = now
+    send_heartbeat_state("ACTIVE", force=False)
 
 
 def send_heartbeat_state(state: str, force: bool = False):
@@ -538,7 +539,8 @@ def handle_connection(raw_conn: socket.socket, addr):
         report_ips("connected")
         with active_conns_lock:
             active_conns.append(tls_conn)
-        send_heartbeat_state("INACTIVE", force=True)
+        initial_state = "ACTIVE" if (time.time() - last_activity_ts) <= IDLE_TO_INACTIVE_SECONDS else "INACTIVE"
+        send_heartbeat_state(initial_state, force=True)
 
         injector = None
         if not IS_WINDOWS:
