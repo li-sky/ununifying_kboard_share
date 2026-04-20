@@ -2,3 +2,7 @@
 certs/
 __pycache__/
 logs/
+
+
+config_client.json
+config_host.json

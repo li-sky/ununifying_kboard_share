@@ -3,6 +3,7 @@ import re
 import socket
 import ssl
 import sys
+import ctypes
 import threading
 import time
 import platform
@@ -17,6 +18,11 @@ IS_WINDOWS = platform.system().lower() == "windows"
 if IS_WINDOWS:
     from pynput import mouse
     from pynput.keyboard import Controller, Key, KeyCode
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    _user32 = ctypes.windll.user32
 else:
     mouse = None
     Controller = None
@@ -246,6 +252,7 @@ def report_ips(event_name: str):
         "udp_port": LOCAL_UDP_PORT,
         "event": event_name,
     }).encode("utf-8")
+    print(f"[VPS] 正在尝试上报，payload: {payload}")
     try:
         req = request.Request(f"{VPS_BASE_URL}/report", data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
@@ -308,7 +315,12 @@ def get_server_ssl_context() -> ssl.SSLContext:
 
 
 kb = Controller()
-last_heartbeat = 0.0
+last_activity_ts = 0.0
+last_state_sent_ts = 0.0
+last_sent_state = "INACTIVE"
+last_activity_log_ts = 0.0
+IDLE_TO_INACTIVE_SECONDS = max(1.5, HEARTBEAT_INTERVAL * 2.0)
+ACTIVITY_LOG_INTERVAL = 5.0
 active_conns_lock = threading.Lock()
 active_conns: List[socket.socket] = []
 
@@ -407,27 +419,81 @@ def _inject_linux(injector: "UInputKeyboardInjector", action: str, payload: str)
         injector.release_key_name(key_name)
 
 
-def send_heartbeat():
-    global last_heartbeat
+def mark_local_activity():
+    global last_activity_ts, last_activity_log_ts
     now = time.time()
-    if now - last_heartbeat < HEARTBEAT_INTERVAL:
+    last_activity_ts = now
+    if now - last_activity_log_ts >= ACTIVITY_LOG_INTERVAL:
+        print("[HB] 检测到鼠标活动")
+        last_activity_log_ts = now
+
+
+def send_heartbeat_state(state: str, force: bool = False):
+    global last_state_sent_ts, last_sent_state
+    now = time.time()
+    state = state.upper().strip()
+    if state not in {"ACTIVE", "INACTIVE"}:
         return
-    payload = f"HEARTBEAT ACTIVE {LOCAL_ID}\n".encode("utf-8")
+    if not force and state == last_sent_state and (now - last_state_sent_ts < HEARTBEAT_INTERVAL):
+        return
+
+    payload = f"HEARTBEAT {state} {LOCAL_ID}\n".encode("utf-8")
+    failed = 0
     sent = 0
     with active_conns_lock:
-        for conn in list(active_conns):
-            try:
-                conn.sendall(payload)
-                sent += 1
-            except Exception:
-                pass
-    if sent:
-        print(f"[HB] 发送心跳到 {sent} 个连接")
-        last_heartbeat = now
+        conns = list(active_conns)
+
+    if not conns:
+        return
+
+    for conn in conns:
+        try:
+            conn.sendall(payload)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            print(f"[HB] 心跳发送失败: {exc}")
+
+    if sent > 0:
+        print(f"[HB] 发送 {state} 到 {sent} 个连接")
+        last_state_sent_ts = now
+        last_sent_state = state
+    if failed > 0:
+        print(f"[HB] {failed} 个连接发送失败")
+
+
+def heartbeat_sender_thread(stop_event: threading.Event):
+    while not stop_event.is_set():
+        now = time.time()
+        is_active = (now - last_activity_ts) <= IDLE_TO_INACTIVE_SECONDS
+        desired_state = "ACTIVE" if is_active else "INACTIVE"
+        send_heartbeat_state(desired_state, force=False)
+        time.sleep(0.05)
 
 
 def on_move(x, y):
-    send_heartbeat()
+    mark_local_activity()
+
+
+def _get_cursor_pos() -> Tuple[int, int] | None:
+    if not IS_WINDOWS:
+        return None
+    pt = POINT()
+    if _user32.GetCursorPos(ctypes.byref(pt)):
+        return pt.x, pt.y
+    return None
+
+
+def poll_mouse_activity_windows(stop_event: threading.Event):
+    if not IS_WINDOWS:
+        return
+    last_pos = _get_cursor_pos()
+    while not stop_event.is_set():
+        pos = _get_cursor_pos()
+        if pos is not None and pos != last_pos:
+            last_pos = pos
+            mark_local_activity()
+        time.sleep(0.05)
 
 
 def handle_connection(raw_conn: socket.socket, addr):
@@ -472,6 +538,7 @@ def handle_connection(raw_conn: socket.socket, addr):
         report_ips("connected")
         with active_conns_lock:
             active_conns.append(tls_conn)
+        send_heartbeat_state("INACTIVE", force=True)
 
         injector = None
         if not IS_WINDOWS:
@@ -511,6 +578,9 @@ def handle_connection(raw_conn: socket.socket, addr):
                 active_conns.remove(tls_conn)
             except ValueError:
                 pass
+        global last_sent_state, last_state_sent_ts
+        last_sent_state = "INACTIVE"
+        last_state_sent_ts = 0.0
         report_ips("disconnect")
         print("[TCP] 等待新的连接...")
 
@@ -538,12 +608,20 @@ if __name__ == '__main__':
 
     t_tcp = threading.Thread(target=tcp_server, daemon=True)
     t_tcp.start()
+    hb_stop_event = threading.Event()
+    threading.Thread(target=heartbeat_sender_thread, args=(hb_stop_event,), daemon=True).start()
 
     print("Client: 运行中... 按 Ctrl+C 退出")
     try:
         if IS_WINDOWS:
-            with mouse.Listener(on_move=on_move) as listener:
-                listener.join()
+            threading.Thread(target=poll_mouse_activity_windows, args=(hb_stop_event,), daemon=True).start()
+            try:
+                with mouse.Listener(on_move=on_move) as listener:
+                    listener.join()
+            except Exception as exc:
+                print(f"[HB] pynput 鼠标监听失败，回退到光标轮询: {exc}")
+                while True:
+                    time.sleep(1)
         else:
             mouse_paths = CONFIG.get("linux_mouse_devices")
             if mouse_paths and not isinstance(mouse_paths, list):
@@ -556,10 +634,15 @@ if __name__ == '__main__':
             if not mice:
                 raise RuntimeError("未找到鼠标设备。可在 config_client.json 设置 linux_mouse_devices: [\"/dev/input/eventX\"]")
 
-            EvdevMouseWatcher(mice, on_activity=send_heartbeat).start()
+            EvdevMouseWatcher(mice, on_activity=mark_local_activity).start()
             while True:
                 time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
+        if IS_WINDOWS:
+            try:
+                hb_stop_event.set()
+            except Exception:
+                pass
         report_ips("shutdown")
