@@ -34,7 +34,9 @@ struct Args {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
+    #[serde(default)]
     local_id: String,
+    #[serde(default)]
     remote_id: String,
     #[serde(default = "default_tcp_port")]
     tcp_port: u16,
@@ -102,6 +104,44 @@ fn main() -> Result<()> {
 fn run(paths: RuntimePaths) -> Result<()> {
     let mut cfg = load_config(&paths.config_path)?;
     resolve_config_paths(&mut cfg, &paths.config_dir);
+
+    // First-run setup: when local_id is empty the config was just created.
+    // Skip the engine and open the configuration editor so the user can run
+    // the setup wizard; saving restarts the app with a complete config.
+    if cfg.local_id.trim().is_empty() {
+        tracing::info!("first-run detected; launching configuration editor");
+        #[cfg(windows)]
+        {
+            let session_active = Arc::new(AtomicBool::new(false));
+            let events = kbshare_tray::launch_config_editor(
+                paths.config_path.clone(),
+                "kbshare".to_string(),
+                session_active,
+            )?;
+            match events.recv() {
+                Ok(kbshare_tray::ConfigEditorEvent::Saved(path)) => {
+                    tracing::info!(path = %path.display(), "configuration saved; restarting");
+                    relaunch_with_config(&path)?;
+                    return Ok(());
+                }
+                Ok(kbshare_tray::ConfigEditorEvent::Failed(error)) => {
+                    return Err(anyhow!("configuration editor failed: {error}"));
+                }
+                Err(error) => {
+                    return Err(anyhow!("configuration editor closed unexpectedly: {error}"));
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            return Err(anyhow!(
+                "configuration at {} is empty; the interactive setup wizard is only available on Windows. \
+                 Fill in local_id, remote_id and other fields manually.",
+                paths.config_path.display()
+            ));
+        }
+    }
+
     cfg.flow_lite
         .ensure_layout(&cfg.local_id, &cfg.remote_id, kbshare_flow::FlowRole::Host);
 
@@ -536,6 +576,15 @@ fn resolve_config_paths(cfg: &mut Config, config_dir: &Path) {
 }
 
 fn load_config(path: &Path) -> Result<Config> {
+    if !path.exists() {
+        tracing::info!(path = %path.display(), "config not found; creating empty config for first-run setup");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, b"{}\n")
+            .with_context(|| format!("create initial config {}", path.display()))?;
+        return Ok(serde_json::from_slice(b"{}")?);
+    }
     let bytes = std::fs::read(path).with_context(|| format!("read config {}", path.display()))?;
     Ok(serde_json::from_slice(&bytes)?)
 }
