@@ -1,0 +1,16 @@
+.venv/
+
+# Local runtime state
+/certs/
+/logs/
+/config_client.json
+/config_host.json
+/*_trust.json
+
+# Local archives
+/*.zip
+
+# Rust build and runtime state
+/target/
+/runtime_client/
+/runtime_host/

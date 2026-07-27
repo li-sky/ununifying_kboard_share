@@ -1,0 +1,20 @@
+{
+  "local_id": "alpha",
+  "remote_id": "beta",
+  "tcp_port": 5005,
+  "cert_file": "certs/kbshare_cert.pem",
+  "key_file": "certs/kbshare_key.pem",
+  "trust_store": "trust.json",
+  "fallback_remote_ips": ["192.168.1.42"],
+  "vps_base_url": null,
+  "auto_trust_first_seen": true,
+  "reconnect_secs": 3,
+  "heartbeat_secs": 1.0,
+  "idle_after_secs": 3.0,
+  "flow_lite": {
+    "enabled": false,
+    "local_host": 0,
+    "remote_host": 2,
+    "edge_px": 2
+  }
+}

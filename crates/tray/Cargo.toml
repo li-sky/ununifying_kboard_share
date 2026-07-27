@@ -1,0 +1,23 @@
+[package]
+name = "kbshare-tray"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+kbshare-flow = { path = "../flow" }
+kbshare-net = { path = "../net" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.19", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+open = "5"
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_WindowsAndMessaging",
+] }

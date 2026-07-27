@@ -1,0 +1,25 @@
+[package]
+name = "kbshare-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "kbshare_platform"
+path = "src/lib.rs"
+
+[dependencies]
+kbshare-core = { path = "../core" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+once_cell = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = { workspace = true }

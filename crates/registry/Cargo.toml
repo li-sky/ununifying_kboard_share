@@ -1,0 +1,17 @@
+[package]
+name = "kbshare-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kbshare-registry"
+path = "src/main.rs"
+
+[dependencies]
+kbshare-net = { path = "../net" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
