@@ -4,8 +4,6 @@
 //!   cargo run -p kbshare-flow --bin sn-probe
 //!   KBSHARE_FLOW_DEBUG=1 cargo run -p kbshare-flow --bin sn-probe
 
-#![cfg(windows)]
-
 use anyhow::{bail, Context, Result};
 use hidapi::HidApi;
 use std::time::{Duration, Instant};

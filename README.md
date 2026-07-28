@@ -227,6 +227,25 @@ cargo run -p kbshare-tray --bin kbshare-config -- runtime_alpha/config.json kbsh
 cargo run -p kbshare-flow -- inspect
 ```
 
+Windows 和 Linux 都支持 HID++ 探测与切换。Linux 通过 `/dev/hidraw*`
+访问设备；当前用户必须对 Logitech hidraw 节点有读写权限。桌面 Linux
+可以添加以下 udev 规则：
+
+```udev
+# /etc/udev/rules.d/70-kbshare-logitech.rules
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", MODE="0660", GROUP="input", TAG+="uaccess"
+```
+
+```bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=hidraw
+sudo usermod -aG input "$USER"
+```
+
+重新登录后运行 `cargo run -p kbshare-flow -- collections` 检查设备集合。
+WSL 不会自动暴露 Windows USB 设备；接收器需要先通过 USB 透传连接到 WSL，
+并确认发行版中出现 `/dev/hidraw*`，之后 Flow-lite 的操作与普通 Linux 相同。
+
 `flow_lite.enabled` 开启后，鼠标从布局中指向当前对端的屏幕边缘切换机器；
 默认布局是本机在左、对端在右。host 编号从 0 开始，因此设备 3 的
 `host_index` 是 `2`。

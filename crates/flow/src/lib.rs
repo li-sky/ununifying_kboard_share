@@ -235,7 +235,7 @@ impl FlowDevice {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod platform {
     use super::*;
     use anyhow::{anyhow, Context};
@@ -716,25 +716,25 @@ mod platform {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub use platform::{collections, inspect, inspect_with_fingerprint, switch_host};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn inspect() -> Result<Vec<FlowDevice>> {
-    bail!("kbshare-flow HID++ access is currently implemented for Windows")
+    bail!("kbshare-flow HID++ access is currently implemented for Windows and Linux")
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn inspect_with_fingerprint() -> Result<Vec<FlowDevice>> {
     inspect()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn collections() -> Result<Vec<HidCollection>> {
-    bail!("kbshare-flow HID++ access is currently implemented for Windows")
+    bail!("kbshare-flow HID++ access is currently implemented for Windows and Linux")
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn switch_host(_slot: Option<u8>, _target_host: u8) -> Result<FlowDevice> {
-    bail!("kbshare-flow HID++ access is currently implemented for Windows")
+    bail!("kbshare-flow HID++ access is currently implemented for Windows and Linux")
 }
