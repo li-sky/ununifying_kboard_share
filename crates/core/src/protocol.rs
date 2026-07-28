@@ -76,11 +76,19 @@ pub enum Message {
     Flush { id: String },
     /// The shared mouse is about to switch from the client back to the host.
     FlowReturn { id: String },
+    /// Logitech mouse information discovered locally after the session starts.
+    /// Peers only enable Flow-lite when both non-empty fingerprints match.
+    MouseInfo {
+        id: String,
+        fingerprint: Option<Vec<u8>>,
+        current_host: u8,
+        slot: Option<u8>,
+    },
     /// Versioned device topology. Both peers keep the newest complete layout.
     FlowLayout { id: String, layout: FlowLayout },
 }
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -138,6 +146,19 @@ mod tests {
         };
         let encoded = serde_json::to_string(&msg).unwrap();
         assert!(encoded.contains("\"type\":\"flow_return\""));
+        assert_eq!(serde_json::from_str::<Message>(&encoded).unwrap(), msg);
+    }
+
+    #[test]
+    fn mouse_info_roundtrip_preserves_binary_fingerprint() {
+        let msg = Message::MouseInfo {
+            id: "desktop".into(),
+            fingerprint: Some((0..16).collect()),
+            current_host: 1,
+            slot: Some(2),
+        };
+        let encoded = serde_json::to_string(&msg).unwrap();
+        assert!(encoded.contains("\"type\":\"mouse_info\""));
         assert_eq!(serde_json::from_str::<Message>(&encoded).unwrap(), msg);
     }
 

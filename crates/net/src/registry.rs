@@ -1,7 +1,8 @@
 //! Minimal registry HTTP client + embedded server.
 //!
 //! Wire-compatible with the Python reference: POST `/report`, GET `/node/<id>`,
-//! all JSON bodies. The embedded server is used by the `registry` binary.
+//! GET `/nodes`, all JSON bodies. The embedded server is used by the
+//! `registry` binary.
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -65,6 +66,12 @@ impl RegistryClient {
         let entry: NodeEntry = self.agent.get(&url).call()?.into_json()?;
         Ok(entry)
     }
+
+    pub fn list(&self) -> Result<Vec<NodeEntry>> {
+        let url = format!("{}/nodes", self.base_url);
+        let entries: Vec<NodeEntry> = self.agent.get(&url).call()?.into_json()?;
+        Ok(entries)
+    }
 }
 
 // ------------------------- Embedded server -------------------------
@@ -99,6 +106,12 @@ impl RegistryStore {
     pub fn lookup(&self, node_id: &str) -> Option<NodeEntry> {
         self.inner.lock().get(node_id).cloned()
     }
+
+    pub fn list(&self) -> Vec<NodeEntry> {
+        let mut entries = self.inner.lock().values().cloned().collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        entries
+    }
 }
 
 /// Run a blocking HTTP server on `bind`. Plain HTTP only; deploy behind
@@ -114,6 +127,7 @@ pub fn serve_http(store: Arc<RegistryStore>, bind: &str) -> Result<()> {
             ("GET", path) if path.starts_with("/node/") => {
                 handle_lookup(path.trim_start_matches("/node/"), &store)
             }
+            ("GET", "/nodes") => (200, serde_json::to_string(&store.list())?),
             ("GET", "/health") => (200, r#"{"status":"healthy"}"#.to_string()),
             _ => (404, "{}".into()),
         };
@@ -146,5 +160,33 @@ fn handle_lookup(node_id: &str, store: &Arc<RegistryStore>) -> (u16, String) {
     match store.lookup(node_id) {
         Some(entry) => (200, serde_json::to_string(&entry).unwrap()),
         None => (404, r#"{"error":"not found"}"#.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(node_id: &str) -> NodeReport {
+        NodeReport {
+            node_id: node_id.into(),
+            ips: vec!["192.0.2.1".into()],
+            tcp_port: Some(5005),
+            udp_port: None,
+            event: "online".into(),
+        }
+    }
+
+    #[test]
+    fn list_returns_all_nodes_in_stable_order() {
+        let store = RegistryStore::new();
+        store.upsert(report("zeta"));
+        store.upsert(report("alpha"));
+        let ids = store
+            .list()
+            .into_iter()
+            .map(|entry| entry.node_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["alpha", "zeta"]);
     }
 }

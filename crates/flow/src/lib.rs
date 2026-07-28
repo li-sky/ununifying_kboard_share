@@ -7,6 +7,7 @@ const LOGITECH_VENDOR_ID: u16 = 0x046d;
 const BOLT_RECEIVER_PID: u16 = 0xc548;
 const UNIFYING_RECEIVER_PIDS: [u16; 2] = [0xc52b, 0xc532];
 const FEATURE_ROOT: u16 = 0x0000;
+const FEATURE_DEVICE_FINGERPRINT: u16 = 0x0003;
 const FEATURE_DEVICE_TYPE_AND_NAME: u16 = 0x0005;
 const FEATURE_CHANGE_HOST: u16 = 0x1814;
 const REPORT_LONG: u8 = 0x11;
@@ -19,6 +20,8 @@ pub struct FlowLiteConfig {
     pub enabled: bool,
     #[serde(default)]
     pub slot: Option<u8>,
+    #[serde(default)]
+    pub fingerprint: Option<[u8; 16]>,
     #[serde(default = "default_local_host")]
     pub local_host: u8,
     #[serde(default = "default_remote_host")]
@@ -34,6 +37,7 @@ impl Default for FlowLiteConfig {
         Self {
             enabled: false,
             slot: None,
+            fingerprint: None,
             local_host: default_local_host(),
             remote_host: default_remote_host(),
             edge_px: default_edge_px(),
@@ -160,6 +164,31 @@ pub fn persist_layout(config_path: &Path, layout: &FlowLayout) -> Result<()> {
     Ok(())
 }
 
+pub fn persist_flow_lite(config_path: &Path, config: &FlowLiteConfig) -> Result<()> {
+    let bytes = std::fs::read(config_path)?;
+    let mut root: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("configuration root must be an object"))?;
+    let flow = object
+        .entry("flow_lite")
+        .or_insert_with(|| serde_json::json!({}));
+    let flow_object = flow
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("flow_lite must be an object"))?;
+    let serialized = serde_json::to_value(config)?;
+    for (key, value) in serialized
+        .as_object()
+        .expect("FlowLiteConfig serializes as an object")
+    {
+        flow_object.insert(key.clone(), value.clone());
+    }
+    let mut output = serde_json::to_vec_pretty(&root)?;
+    output.push(b'\n');
+    std::fs::write(config_path, output)?;
+    Ok(())
+}
+
 fn default_local_host() -> u8 {
     0
 }
@@ -187,6 +216,7 @@ pub struct FlowDevice {
     pub feature_index: u8,
     pub host_count: u8,
     pub current_host: u8,
+    pub fingerprint: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +353,23 @@ mod platform {
         Ok((!name.is_empty()).then(|| String::from_utf8_lossy(&name).into_owned()))
     }
 
+    fn read_fingerprint(device: &HidDevice, slot: u8) -> Result<Option<[u8; 16]>> {
+        let Some(feature_index) = resolve_feature(device, slot, FEATURE_DEVICE_FINGERPRINT)? else {
+            return Ok(None);
+        };
+        for attempt in 0..3 {
+            if let Some(reply) = request(device, slot, (feature_index as u16) << 8, &[])? {
+                if let Ok(fingerprint) = <[u8; 16]>::try_from(reply.as_slice()) {
+                    return Ok(Some(fingerprint));
+                }
+            }
+            if attempt < 2 {
+                std::thread::sleep(Duration::from_millis(75));
+            }
+        }
+        Ok(None)
+    }
+
     fn inspect_slot(
         device: &HidDevice,
         path: String,
@@ -349,6 +396,7 @@ mod platform {
             Some(index) => read_name(device, slot, index)?,
             None => None,
         };
+        let fingerprint = read_fingerprint(device, slot)?;
         Ok(Some(FlowDevice {
             path,
             product_id,
@@ -359,6 +407,7 @@ mod platform {
             feature_index,
             host_count: host_info[0],
             current_host: host_info[1],
+            fingerprint,
         }))
     }
 
@@ -405,6 +454,17 @@ mod platform {
     }
 
     pub fn inspect() -> Result<Vec<FlowDevice>> {
+        inspect_with_fingerprint()
+    }
+
+    pub fn inspect_with_fingerprint() -> Result<Vec<FlowDevice>> {
+        let devices = inspect_matching(None)?;
+        if !devices.is_empty() {
+            return Ok(devices);
+        }
+        // The first query can also wake a sleeping mouse. Retry the complete
+        // scan once so transient HID++ timeouts do not disable auto-setup.
+        std::thread::sleep(Duration::from_millis(150));
         inspect_matching(None)
     }
 
@@ -540,6 +600,35 @@ mod platform {
         }
 
         #[test]
+        fn persist_flow_lite_preserves_unknown_flow_fields() {
+            let path = std::env::temp_dir().join(format!(
+                "kbshare-flow-config-{}-{}.json",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::write(
+                &path,
+                br#"{"local_id":"host","flow_lite":{"vendor_extension":17}}"#,
+            )
+            .unwrap();
+            let config = FlowLiteConfig {
+                enabled: true,
+                fingerprint: Some([3; 16]),
+                ..FlowLiteConfig::default()
+            };
+            persist_flow_lite(&path, &config).unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["flow_lite"]["vendor_extension"], 17);
+            assert_eq!(saved["flow_lite"]["enabled"], true);
+            assert_eq!(saved["flow_lite"]["fingerprint"][0], 3);
+            std::fs::remove_file(path).unwrap();
+        }
+
+        #[test]
         fn two_peers_converge_on_the_newer_layout() {
             let mut host = FlowLayout {
                 version: 20,
@@ -581,11 +670,16 @@ mod platform {
 }
 
 #[cfg(windows)]
-pub use platform::{collections, inspect, switch_host};
+pub use platform::{collections, inspect, inspect_with_fingerprint, switch_host};
 
 #[cfg(not(windows))]
 pub fn inspect() -> Result<Vec<FlowDevice>> {
     bail!("kbshare-flow HID++ access is currently implemented for Windows")
+}
+
+#[cfg(not(windows))]
+pub fn inspect_with_fingerprint() -> Result<Vec<FlowDevice>> {
+    inspect()
 }
 
 #[cfg(not(windows))]

@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "kbshare-flow"
 path = "src/main.rs"
 
+[[bin]]
+name = "sn-probe"
+path = "src/bin/sn_probe.rs"
+
 [dependencies]
 kbshare-core = { path = "../core" }
 anyhow = { workspace = true }

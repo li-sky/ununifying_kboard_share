@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -12,7 +12,11 @@ pub enum EditorEvent {
     Failed(String),
 }
 
-pub fn launch(config_path: PathBuf, app_name: String, session_active: Arc<AtomicBool>) -> Result<Receiver<EditorEvent>> {
+pub fn launch(
+    config_path: PathBuf,
+    app_name: String,
+    session_active: Arc<AtomicBool>,
+) -> Result<Receiver<EditorEvent>> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind local editor")?;
     let address = listener.local_addr()?;
     let token = format!(
@@ -30,7 +34,14 @@ pub fn launch(config_path: PathBuf, app_name: String, session_active: Arc<Atomic
     std::thread::Builder::new()
         .name("config-editor".into())
         .spawn(move || {
-            if let Err(error) = serve(listener, &route, &config_path, &app_name, &sender, &session_active) {
+            if let Err(error) = serve(
+                listener,
+                &route,
+                &config_path,
+                &app_name,
+                &sender,
+                &session_active,
+            ) {
                 let _ = sender.send(EditorEvent::Failed(format!("{error:#}")));
             }
         })?;
@@ -100,6 +111,7 @@ fn serve(
                                     "slot": device.slot,
                                     "host_count": device.host_count,
                                     "current_host": device.current_host,
+                                    "fingerprint": device.fingerprint.map(hex_fingerprint),
                                     "is_mouse": is_mouse,
                                 })
                             }).collect::<Vec<_>>()
@@ -126,8 +138,7 @@ fn serve(
                 }
             }
             Ok(request)
-                if request.method == "POST"
-                    && request.path == format!("{route}/certificate") =>
+                if request.method == "POST" && request.path == format!("{route}/certificate") =>
             {
                 let result = (|| -> Result<Value> {
                     let payload: Value = serde_json::from_slice(&request.body)?;
@@ -138,11 +149,8 @@ fn serve(
                     let cert_path = resolve_editor_path(config_dir, cert_file);
                     let key_path = resolve_editor_path(config_dir, key_file);
                     let existed = cert_path.exists() && key_path.exists();
-                    let bundle = kbshare_net::cert::load_or_create_cert(
-                        &cert_path,
-                        &key_path,
-                        local_id,
-                    )?;
+                    let bundle =
+                        kbshare_net::cert::load_or_create_cert(&cert_path, &key_path, local_id)?;
                     Ok(serde_json::json!({
                         "ok": true,
                         "created": !existed,
@@ -154,28 +162,55 @@ fn serve(
                 respond_json_result(&mut stream, result)?;
             }
             Ok(request)
-                if request.method == "POST" && request.path == format!("{route}/discover") =>
+                if request.method == "POST" && request.path == format!("{route}/register") =>
             {
                 let result = (|| -> Result<Value> {
                     let payload: Value = serde_json::from_slice(&request.body)?;
-                    let base_url = required_string(&payload, "base_url")?;
-                    let remote_id = required_string(&payload, "remote_id")?;
-                    let entry = kbshare_net::registry::RegistryClient::new(base_url)
-                        .lookup(remote_id)
-                        .with_context(|| format!("discover {remote_id}"))?;
+                    let local_id = required_string(&payload, "local_id")?;
+                    let base_url = required_string(&payload, "vps_base_url")?;
+                    let tcp_port = payload["tcp_port"]
+                        .as_u64()
+                        .filter(|port| (1..=u16::MAX as u64).contains(port))
+                        .context("tcp_port must be between 1 and 65535")?
+                        as u16;
+                    let ip = local_ip().context("could not determine this machine's local IP")?;
+                    let report = kbshare_net::registry::NodeReport {
+                        node_id: local_id.to_string(),
+                        ips: vec![ip.clone()],
+                        tcp_port: Some(tcp_port),
+                        udp_port: None,
+                        event: "online".into(),
+                    };
+                    kbshare_net::registry::RegistryClient::new(base_url)
+                        .report(&report)
+                        .with_context(|| format!("register {local_id}"))?;
+                    save_config(config_path, &request.body)?;
                     Ok(serde_json::json!({
                         "ok": true,
-                        "node_id": entry.node_id,
-                        "ips": entry.ips,
-                        "tcp_port": entry.tcp_port,
-                        "updated_at": entry.updated_at,
+                        "node_id": local_id,
+                        "ips": [ip],
+                        "tcp_port": tcp_port,
                     }))
+                })();
+                let registered = result.is_ok();
+                respond_json_result(&mut stream, result)?;
+                if registered {
+                    let _ = sender.send(EditorEvent::Saved(config_path.to_path_buf()));
+                    return Ok(());
+                }
+            }
+            Ok(request) if request.method == "POST" && request.path == format!("{route}/nodes") => {
+                let result = (|| -> Result<Value> {
+                    let payload: Value = serde_json::from_slice(&request.body)?;
+                    let base_url = required_string(&payload, "base_url")?;
+                    let nodes = kbshare_net::registry::RegistryClient::new(base_url)
+                        .list()
+                        .context("list registered nodes")?;
+                    Ok(serde_json::json!({ "ok": true, "nodes": nodes }))
                 })();
                 respond_json_result(&mut stream, result)?;
             }
-            Ok(request)
-                if request.method == "GET" && request.path == format!("{route}/status") =>
-            {
+            Ok(request) if request.method == "GET" && request.path == format!("{route}/status") => {
                 let body = serde_json::json!({
                     "ok": true,
                     "connected": session_active.load(Ordering::Relaxed),
@@ -207,6 +242,19 @@ fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .with_context(|| format!("{key} is required"))
+}
+
+fn local_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+fn hex_fingerprint(value: [u8; 16]) -> String {
+    value
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 fn resolve_editor_path(config_dir: &Path, value: &str) -> PathBuf {
@@ -310,16 +358,14 @@ fn save_config(path: &Path, body: &[u8]) -> Result<()> {
     if !value.is_object() {
         bail!("configuration root must be a JSON object");
     }
-    for field in ["local_id", "remote_id"] {
-        if value
-            .get(field)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .is_empty()
-        {
-            bail!("{field} must not be empty");
-        }
+    if value
+        .get("local_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        bail!("local_id must not be empty");
     }
     let port = value
         .get("tcp_port")
@@ -348,7 +394,6 @@ fn validate_layout(config: &Value) -> Result<()> {
         return Ok(());
     };
     let local_id = config["local_id"].as_str().unwrap_or_default();
-    let remote_id = config["remote_id"].as_str().unwrap_or_default();
     let mut ids = std::collections::HashSet::new();
     for device in devices {
         let id = device["id"].as_str().unwrap_or_default().trim();
@@ -373,8 +418,8 @@ fn validate_layout(config: &Value) -> Result<()> {
             }
         }
     }
-    if !ids.contains(local_id) || !ids.contains(remote_id) {
-        bail!("Flow layout must contain both local_id and remote_id devices");
+    if !local_id.is_empty() && !ids.contains(local_id) {
+        bail!("Flow layout must contain local_id");
     }
     Ok(())
 }
@@ -383,18 +428,26 @@ fn render_page(config: &Value, app_name: &str, route: &str) -> Result<String> {
     let initial = serde_json::to_string(config)?.replace('<', "\\u003c");
     let local_id = config["local_id"].as_str().unwrap_or("");
     let remote_id = config["remote_id"].as_str().unwrap_or("");
-    let role = if local_id < remote_id { "host" } else { "client" };
-    Ok(PAGE
+    let role = if remote_id.is_empty() {
+        "registered"
+    } else if local_id < remote_id {
+        "host"
+    } else {
+        "client"
+    };
+    Ok(PAGE_V2
         .replace("__INITIAL_CONFIG__", &initial)
         .replace("__APP_NAME__", app_name)
         .replace("__ROLE__", role)
         .replace("__SAVE_ROUTE__", &format!("{route}/save"))
         .replace("__INSPECT_ROUTE__", &format!("{route}/inspect"))
         .replace("__CERTIFICATE_ROUTE__", &format!("{route}/certificate"))
-        .replace("__DISCOVER_ROUTE__", &format!("{route}/discover"))
+        .replace("__REGISTER_ROUTE__", &format!("{route}/register"))
+        .replace("__NODES_ROUTE__", &format!("{route}/nodes"))
         .replace("__STATUS_ROUTE__", &format!("{route}/status")))
 }
 
+#[allow(dead_code)]
 const PAGE: &str = r#"<!doctype html>
 <html lang="en">
 <head>
@@ -631,6 +684,158 @@ const PAGE: &str = r#"<!doctype html>
 </script>
 </body></html>"#;
 
+const PAGE_V2: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>__APP_NAME__ configuration</title>
+  <style>
+    :root { --ink:#17202a; --muted:#66717d; --line:#d8dee5; --paper:#f5f7f8; --accent:#087e8b; --danger:#c43d43; --ok:#18794e; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font-family:"Aptos","Segoe UI Variable",sans-serif; }
+    button,input,textarea { font:inherit; }
+    header { padding:22px clamp(20px,5vw,64px); display:flex; align-items:end; justify-content:space-between; gap:20px; color:white; background:var(--ink); }
+    .brand { font-family:"Bahnschrift SemiCondensed","Aptos Display",sans-serif; font-size:28px; font-weight:600; }
+    .role { margin-top:4px; color:#9fe1e8; font-size:12px; text-transform:uppercase; }
+    .guide { padding:9px 13px; color:white; background:transparent; border:1px solid #7e929f; border-radius:4px; cursor:pointer; }
+    main { width:min(940px,calc(100% - 32px)); margin:30px auto; background:white; border:1px solid var(--line); box-shadow:0 18px 50px rgba(23,32,42,.09); }
+    nav { display:flex; overflow:auto; background:#eef1f4; border-bottom:1px solid var(--line); }
+    .tab { padding:15px 20px; color:var(--muted); background:transparent; border:0; border-right:1px solid var(--line); cursor:pointer; }
+    .tab[aria-selected=true] { color:var(--ink); background:white; box-shadow:inset 0 3px var(--accent); }
+    .panel { display:none; padding:28px; }
+    .panel.active { display:block; }
+    h2 { margin:0 0 8px; font-size:22px; }
+    h3 { margin:26px 0 12px; font-size:16px; }
+    .copy { margin:0 0 22px; color:var(--muted); line-height:1.55; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px 22px; }
+    label { display:grid; gap:7px; color:var(--muted); font-size:13px; }
+    input,textarea { width:100%; padding:10px 11px; color:var(--ink); background:white; border:1px solid #bcc5ce; border-radius:4px; outline:none; }
+    input:focus,textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(8,126,139,.14); }
+    input[readonly] { color:#4d5965; background:#f3f5f6; }
+    textarea { min-height:380px; resize:vertical; font-family:"Cascadia Code",Consolas,monospace; font-size:13px; line-height:1.5; }
+    .wide { grid-column:1/-1; }
+    .status-card { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:22px; padding:14px 16px; background:#f5fafb; border:1px solid #c9e0e3; }
+    .status-card strong { display:block; }
+    .status-card span { color:var(--muted); font-size:13px; }
+    .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    button.primary,.save { padding:10px 16px; color:white; background:var(--accent); border:1px solid var(--accent); border-radius:4px; cursor:pointer; font-weight:600; }
+    button.secondary { padding:9px 13px; color:var(--ink); background:white; border:1px solid #aeb8c2; border-radius:4px; cursor:pointer; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .node-list { display:grid; gap:8px; margin-top:12px; }
+    .node { display:grid; grid-template-columns:1fr auto; align-items:center; gap:12px; padding:13px 14px; text-align:left; color:var(--ink); background:white; border:1px solid var(--line); border-radius:4px; cursor:pointer; }
+    .node:hover,.node.selected { border-color:var(--accent); background:#f3fbfc; }
+    .node small { display:block; margin-top:3px; color:var(--muted); }
+    .badge { padding:4px 8px; color:var(--accent); background:#e1f3f5; border-radius:999px; font-size:12px; }
+    .empty { padding:18px; color:var(--muted); text-align:center; border:1px dashed #bfc8d0; }
+    .readonly-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); }
+    .datum { min-width:0; padding:14px; background:white; }
+    .datum span { display:block; margin-bottom:5px; color:var(--muted); font-size:12px; }
+    .datum strong { overflow-wrap:anywhere; }
+    .device-list { margin:10px 0 0; padding-left:20px; color:#42505d; }
+    footer { display:flex; align-items:center; gap:14px; padding:18px 28px; background:#f0f2f4; border-top:1px solid var(--line); }
+    #status { margin-right:auto; color:var(--muted); font-size:13px; }
+    #status.error { color:var(--danger); } #status.ok { color:var(--ok); }
+    .wizard { position:fixed; inset:0; z-index:10; display:grid; place-items:center; padding:22px; background:rgba(12,19,25,.72); }
+    .wizard[hidden] { display:none; }
+    .wizard-window { width:min(760px,100%); max-height:calc(100vh - 44px); display:grid; grid-template-rows:auto auto minmax(0,1fr) auto; overflow:hidden; background:white; box-shadow:0 28px 80px rgba(0,0,0,.32); }
+    .wizard-header { padding:22px 28px 16px; border-bottom:1px solid var(--line); }
+    .wizard-header h1 { margin:0; font-size:25px; }
+    .wizard-header p { margin:7px 0 0; color:var(--muted); }
+    .progress { display:grid; grid-template-columns:repeat(3,1fr); background:#edf1f3; border-bottom:1px solid var(--line); }
+    .progress span { padding:10px; text-align:center; color:var(--muted); font-size:12px; border-right:1px solid var(--line); }
+    .progress span.active { color:var(--ink); background:white; box-shadow:inset 0 3px var(--accent); font-weight:700; }
+    .wizard-body { overflow:auto; padding:28px; }
+    .step { display:none; } .step.active { display:block; }
+    .result { margin-top:16px; padding:12px 14px; color:var(--muted); background:#f3f5f6; border-left:3px solid #aeb8c2; line-height:1.45; }
+    .result.ok { color:var(--ok); border-left-color:var(--ok); } .result.error { color:var(--danger); border-left-color:var(--danger); }
+    .wizard-actions { display:flex; align-items:center; justify-content:flex-end; gap:10px; padding:15px 28px; background:#f5f7f8; border-top:1px solid var(--line); }
+    .wizard-actions .secondary { margin-right:auto; }
+    @media(max-width:680px) { .grid,.readonly-grid { grid-template-columns:1fr; } .wide { grid-column:auto; } main { width:100%; margin:0; border:0; } .panel { padding:22px 18px; } footer { padding:16px 18px; } .wizard { padding:0; } .wizard-window { width:100%; height:100vh; max-height:none; } }
+  </style>
+</head>
+<body>
+  <header><div><div class="brand">kbshare configuration</div><div class="role">__ROLE__ node</div></div><button class="guide" id="open_wizard" type="button">Registration guide</button></header>
+  <main>
+    <nav><button class="tab" data-panel="connection" aria-selected="true">Connection</button><button class="tab" data-panel="flow" aria-selected="false">Flow-Lite</button><button class="tab" data-panel="advanced" aria-selected="false">Advanced JSON</button></nav>
+    <section class="panel active" id="connection">
+      <h2>Connect another machine</h2><p class="copy">This node is registered independently. Choose a peer from the registry; mouse channels and receiver slots are detected only after the secure session connects.</p>
+      <div class="status-card"><div><strong id="connection_title">Registered · waiting for connection</strong><span id="connection_detail"></span></div><span class="badge" id="connection_badge">Waiting</span></div>
+      <div class="grid">
+        <label>This machine<input id="local_id" readonly></label>
+        <label>Selected peer<input id="remote_id" readonly placeholder="No peer selected"></label>
+        <label class="wide">Registry endpoint<input id="registry_url" type="url" placeholder="https://registry.example.com"></label>
+        <label>Listening TCP port<input id="tcp_port" type="number" min="1" max="65535"></label>
+      </div>
+      <h3>Available machines</h3>
+      <div class="row"><button class="secondary" id="refresh_nodes" type="button">Refresh list</button><span class="copy" id="nodes_hint" style="margin:0">Load nodes registered at this endpoint.</span></div>
+      <div class="node-list" id="node_list"></div>
+    </section>
+    <section class="panel" id="flow">
+      <h2>Flow-Lite automatic configuration</h2><p class="copy">These values are read-only. They are populated after both machines report the same 16-byte mouse fingerprint.</p>
+      <div class="readonly-grid">
+        <div class="datum"><span>Status</span><strong id="flow_enabled">Not detected</strong></div>
+        <div class="datum"><span>Receiver slot</span><strong id="flow_slot">—</strong></div>
+        <div class="datum"><span>Local host channel</span><strong id="flow_local_host">—</strong></div>
+        <div class="datum"><span>Remote host channel</span><strong id="flow_remote_host">—</strong></div>
+        <div class="datum wide"><span>Feature 0x0003 fingerprint</span><strong id="flow_fingerprint">—</strong></div>
+      </div>
+      <h3>Automatically discovered layout</h3><ul class="device-list" id="layout_devices"></ul>
+      <div class="row" style="margin-top:20px"><button class="secondary" id="inspect_mouse" type="button">Inspect this machine now</button><span id="inspect_result" class="copy" style="margin:0"></span></div>
+    </section>
+    <section class="panel" id="advanced"><h2>Advanced configuration</h2><p class="copy">Unknown fields are preserved. Flow-Lite identity fields should normally be left to automatic detection.</p><textarea id="raw" spellcheck="false"></textarea></section>
+    <footer><span id="status">Ready</span><button class="save" id="save" type="button">Save and restart</button></footer>
+  </main>
+
+  <div class="wizard" id="wizard" hidden>
+    <div class="wizard-window" role="dialog" aria-modal="true">
+      <div class="wizard-header"><h1>Register this machine</h1><p id="wizard_subtitle">Registration does not look up or configure another machine.</p></div>
+      <div class="progress"><span class="active">1 · Name</span><span>2 · Certificate</span><span>3 · Register</span></div>
+      <div class="wizard-body">
+        <section class="step active"><h2>Name this machine</h2><p class="copy">Choose a stable, unique identifier for this computer.</p><label>This machine<input id="wizard_local_id" autocomplete="off" placeholder="office-desktop"></label></section>
+        <section class="step"><h2>Create this machine's certificate</h2><p class="copy">Existing certificate and key files are verified and reused.</p><div class="grid"><label>Certificate file<input id="wizard_cert_file"></label><label>Private key file<input id="wizard_key_file"></label></div><div class="row" style="margin-top:18px"><button class="secondary" id="generate_certificate" type="button">Generate or verify certificate</button></div><div class="result" id="certificate_result">Certificate has not been verified yet.</div></section>
+        <section class="step"><h2>Report this machine to the registry</h2><p class="copy">Only this machine's ID, local IP address and listening TCP port are sent. No peer is queried.</p><div class="grid"><label class="wide">Registry endpoint<input id="wizard_registry" type="url" placeholder="https://registry.example.com"></label><label>Listening TCP port<input id="wizard_port" type="number" min="1" max="65535"></label></div><div class="result" id="register_result">Ready to register this machine.</div></section>
+      </div>
+      <div class="wizard-actions"><button class="secondary" id="wizard_exit" type="button">Close guide</button><button class="secondary" id="wizard_back" type="button">Back</button><button class="primary" id="wizard_next" type="button">Next</button></div>
+    </div>
+  </div>
+
+  <script>
+    const saveRoute="__SAVE_ROUTE__", inspectRoute="__INSPECT_ROUTE__", certificateRoute="__CERTIFICATE_ROUTE__", registerRoute="__REGISTER_ROUTE__", nodesRoute="__NODES_ROUTE__", statusRoute="__STATUS_ROUTE__";
+    let cfg=__INITIAL_CONFIG__, wizardStep=0, certificateReady=false, connected=false;
+    const $=id=>document.getElementById(id);
+    cfg.remote_id??=""; cfg.flow_lite??={}; cfg.tcp_port??=5005;
+    function setStatus(message,error=false,ok=false){$("status").textContent=message;$("status").className=error?"error":ok?"ok":"";}
+    function fingerprint(value){return Array.isArray(value)&&value.length?value.map(byte=>Number(byte).toString(16).padStart(2,"0")).join(""):"—";}
+    function render(){
+      $("local_id").value=cfg.local_id??"";$("remote_id").value=cfg.remote_id??"";$("registry_url").value=cfg.vps_base_url??"";$("tcp_port").value=cfg.tcp_port??5005;
+      const f=cfg.flow_lite??{};$("flow_enabled").textContent=f.enabled?"Enabled · fingerprint matched":"Not detected";$("flow_slot").textContent=f.slot??"Bluetooth / direct / unknown";$("flow_local_host").textContent=f.enabled?`Channel ${Number(f.local_host)+1}`:"—";$("flow_remote_host").textContent=f.enabled?`Channel ${Number(f.remote_host)+1}`:"—";$("flow_fingerprint").textContent=fingerprint(f.fingerprint);
+      const devices=f.layout?.devices??[];$("layout_devices").innerHTML=devices.length?devices.map(d=>`<li>${escapeHtml(d.label||d.id)} — channel ${Number(d.host_index)+1}</li>`).join(""):"<li>No matched machines yet.</li>";
+      $("raw").value=JSON.stringify(cfg,null,2);renderConnection();
+    }
+    function escapeHtml(value){const node=document.createElement("span");node.textContent=value;return node.innerHTML;}
+    function collect(){cfg.local_id=$("local_id").value.trim();cfg.remote_id=$("remote_id").value.trim();cfg.tcp_port=Number($("tcp_port").value);const registry=$("registry_url").value.trim();if(registry)cfg.vps_base_url=registry;else delete cfg.vps_base_url;$("raw").value=JSON.stringify(cfg,null,2);return cfg;}
+    function renderConnection(){const peer=cfg.remote_id?.trim();$("connection_title").textContent=connected?`Connected to ${peer||"peer"}`:peer?`Configured for ${peer}`:"Registered · waiting for connection";$("connection_detail").textContent=peer?(connected?"Secure session active":"The app will resolve this peer through the registry."):"Choose a registered machine below.";$("connection_badge").textContent=connected?"Connected":peer?"Configured":"Waiting";}
+    async function pollStatus(){try{const r=await fetch(statusRoute),out=await r.json();if(out.ok){connected=!!out.connected;renderConnection();}}catch(_){}}
+    async function save(data,button){if(!data.local_id)throw new Error("This machine must be registered first");button.disabled=true;setStatus("Saving…");try{const r=await fetch(saveRoute,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Save failed");setStatus("Saved. Restarting application…",false,true);}catch(error){button.disabled=false;setStatus(error.message,true);throw error;}}
+    async function loadNodes(){const button=$("refresh_nodes"),list=$("node_list"),base=$("registry_url").value.trim();if(!base){setStatus("Enter the registry endpoint first",true);return;}button.disabled=true;list.innerHTML='<div class="empty">Loading registered nodes…</div>';try{const r=await fetch(nodesRoute,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({base_url:base})}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Could not load nodes");const nodes=out.nodes.filter(node=>node.node_id!==cfg.local_id);list.innerHTML=nodes.length?"":'<div class="empty">No other registered machines found.</div>';for(const node of nodes){const item=document.createElement("button");item.type="button";item.className=`node${node.node_id===cfg.remote_id?" selected":""}`;const details=(node.ips??[]).join(", ")||"No IP reported";item.innerHTML=`<span><strong>${escapeHtml(node.node_id)}</strong><small>${escapeHtml(details)} · port ${node.tcp_port??cfg.tcp_port}</small></span><span class="badge">${node.node_id===cfg.remote_id?"Selected":"Select"}</span>`;item.onclick=()=>{cfg.remote_id=node.node_id;cfg.vps_base_url=base;$("remote_id").value=node.node_id;renderConnection();loadNodes();};list.append(item);}setStatus(`Loaded ${nodes.length} available machine${nodes.length===1?"":"s"}`,false,true);}catch(error){list.innerHTML=`<div class="empty">${escapeHtml(error.message)}</div>`;setStatus(error.message,true);}finally{button.disabled=false;}}
+    document.querySelectorAll(".tab").forEach(tab=>tab.onclick=()=>{if(document.querySelector(".tab[aria-selected=true]").dataset.panel==="advanced"){try{cfg=JSON.parse($("raw").value);}catch(error){setStatus(error.message,true);return;}render();}document.querySelectorAll(".tab").forEach(item=>item.setAttribute("aria-selected",item===tab));document.querySelectorAll(".panel").forEach(panel=>panel.classList.toggle("active",panel.id===tab.dataset.panel));});
+    $("refresh_nodes").onclick=()=>{collect();loadNodes();};
+    $("save").onclick=async()=>{try{const data=document.querySelector(".tab[aria-selected=true]").dataset.panel==="advanced"?JSON.parse($("raw").value):collect();await save(data,$("save"));}catch(error){setStatus(error.message,true);}};
+    $("inspect_mouse").onclick=async()=>{const button=$("inspect_mouse");button.disabled=true;$("inspect_result").textContent="Inspecting…";try{const r=await fetch(inspectRoute),out=await r.json();if(!out.ok)throw new Error(out.error||"Inspection failed");const mouse=out.devices.find(device=>device.is_mouse);if(!mouse)throw new Error("No compatible Logitech mouse found");$("inspect_result").textContent=`${mouse.name}; channel ${Number(mouse.current_host)+1}; slot ${mouse.connection==="receiver"?mouse.slot:"direct"}; fingerprint ${mouse.fingerprint??"unavailable"}`;}catch(error){$("inspect_result").textContent=error.message;}finally{button.disabled=false;}};
+    function openWizard(){wizardStep=0;certificateReady=false;$("wizard_local_id").value=cfg.local_id??"";$("wizard_cert_file").value=cfg.cert_file??"certs/kbshare_cert.pem";$("wizard_key_file").value=cfg.key_file??"certs/kbshare_key.pem";$("wizard_registry").value=cfg.vps_base_url??"";$("wizard_port").value=cfg.tcp_port??5005;$("certificate_result").className="result";$("certificate_result").textContent="Certificate has not been verified yet.";$("register_result").className="result";$("register_result").textContent="Ready to register this machine.";$("wizard").hidden=false;showStep();}
+    function showStep(){document.querySelectorAll(".step").forEach((step,index)=>step.classList.toggle("active",index===wizardStep));document.querySelectorAll(".progress span").forEach((step,index)=>step.classList.toggle("active",index===wizardStep));$("wizard_back").disabled=wizardStep===0;$("wizard_next").textContent=wizardStep===2?"Register this machine":"Next";}
+    function validateName(){const local=$("wizard_local_id").value.trim();if(!local)throw new Error("Name this machine before continuing");if(local!==cfg.local_id)certificateReady=false;cfg.local_id=local;}
+    $("wizard_next").onclick=async()=>{try{if(wizardStep===0)validateName();else if(wizardStep===1){if(!certificateReady)throw new Error("Generate or verify the certificate before continuing");}else{await registerMachine();return;}wizardStep++;$("wizard_subtitle").textContent="Registration does not look up or configure another machine.";showStep();}catch(error){$("wizard_subtitle").textContent=error.message;}};
+    $("wizard_back").onclick=()=>{if(wizardStep>0){wizardStep--;showStep();}};
+    $("wizard_exit").onclick=()=>$("wizard").hidden=true;$("open_wizard").onclick=openWizard;
+    $("generate_certificate").onclick=async()=>{const button=$("generate_certificate"),result=$("certificate_result");try{validateName();const cert=$("wizard_cert_file").value.trim(),key=$("wizard_key_file").value.trim();if(!cert||!key)throw new Error("Certificate and key paths are required");button.disabled=true;result.className="result";result.textContent="Generating or verifying…";const r=await fetch(certificateRoute,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({local_id:cfg.local_id,cert_file:cert,key_file:key})}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Certificate operation failed");certificateReady=true;cfg.cert_file=cert;cfg.key_file=key;result.className="result ok";result.textContent=`${out.created?"Created":"Verified"} certificate. SHA-256: ${out.fingerprint}`;}catch(error){certificateReady=false;result.className="result error";result.textContent=error.message;}finally{button.disabled=false;}};
+    async function registerMachine(){const button=$("wizard_next"),result=$("register_result"),base=$("wizard_registry").value.trim(),port=Number($("wizard_port").value);validateName();if(!certificateReady)throw new Error("Verify the certificate first");if(!base)throw new Error("Enter the registry endpoint");if(!Number.isInteger(port)||port<1||port>65535)throw new Error("Enter a valid TCP port");cfg.remote_id="";cfg.vps_base_url=base;cfg.tcp_port=port;cfg.flow_lite={...(cfg.flow_lite??{}),enabled:false,slot:null,fingerprint:null,layout:{version:0,updated_by:"",devices:[]}};button.disabled=true;result.className="result";result.textContent="Reporting this machine…";try{const r=await fetch(registerRoute,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Registration failed");result.className="result ok";result.textContent=`Registered ${out.node_id} at ${out.ips.join(", ")}. Restarting in waiting mode…`;setStatus("Registration complete. Restarting…",false,true);}catch(error){button.disabled=false;result.className="result error";result.textContent=error.message;throw error;}}
+    render();pollStatus();setInterval(pollStatus,3000);if(!cfg.local_id)openWizard();else if(cfg.vps_base_url)loadNodes();
+  </script>
+</body>
+</html>"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,13 +849,14 @@ mod tests {
         )
         .unwrap();
         assert!(page.contains("alpha"));
-        assert!(page.contains("const role=\"host\""));
+        assert!(page.contains("host node"));
         assert!(page.contains("/token/save"));
         assert!(page.contains("/token/inspect"));
         assert!(page.contains("/token/certificate"));
-        assert!(page.contains("/token/discover"));
+        assert!(page.contains("/token/register"));
+        assert!(page.contains("/token/nodes"));
         assert!(page.contains("/token/status"));
-        assert!(page.contains("kbshare setup"));
+        assert!(page.contains("Register this machine"));
     }
 
     #[test]
@@ -688,6 +894,23 @@ mod tests {
         let error = save_config(&path, br#"{"local_id":"","remote_id":"peer"}"#).unwrap_err();
         assert!(error.to_string().contains("local_id"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn save_allows_registered_node_without_remote_id() {
+        let path = std::env::temp_dir().join(format!(
+            "kbshare-editor-registered-{}.json",
+            std::process::id()
+        ));
+        save_config(
+            &path,
+            br#"{"local_id":"desktop","remote_id":"","tcp_port":5005}"#,
+        )
+        .unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["local_id"], "desktop");
+        assert_eq!(saved["remote_id"], "");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

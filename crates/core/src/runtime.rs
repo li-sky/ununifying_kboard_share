@@ -137,7 +137,10 @@ impl HostDriver {
             Message::FlowReturn { id } => {
                 tracing::debug!(actual = %id, "FlowReturn from unknown peer ignored");
             }
-            Message::Key { .. } | Message::Flush { .. } | Message::FlowLayout { .. } => {
+            Message::Key { .. }
+            | Message::Flush { .. }
+            | Message::MouseInfo { .. }
+            | Message::FlowLayout { .. } => {
                 tracing::debug!("unexpected key/flush from client (ignored)");
             }
         }
@@ -293,6 +296,7 @@ impl ClientDriver {
             Message::Hello { .. }
             | Message::Heartbeat { .. }
             | Message::FlowReturn { .. }
+            | Message::MouseInfo { .. }
             | Message::FlowLayout { .. } => {}
             Message::Key { action, code } => {
                 // Track for cleanup; always inject so OS-level autorepeat on

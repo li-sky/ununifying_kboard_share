@@ -35,6 +35,8 @@ pub struct TrayConfig {
     pub config_dir: Option<PathBuf>,
     /// Directory containing runtime log files.
     pub log_dir: Option<PathBuf>,
+    /// The node is registered but no peer has been selected yet.
+    pub waiting_for_peer: bool,
 }
 
 #[cfg(windows)]
@@ -169,7 +171,16 @@ mod platform {
         let config_path = cfg.config_path.clone();
         let log_dir = cfg.log_dir.clone();
         let menu = Menu::new();
-        let status_item = MenuItem::new(format!("● {} — Local", cfg.app_name), false, None);
+        let initial_label = if cfg.waiting_for_peer {
+            "Registered · Waiting"
+        } else {
+            "Local"
+        };
+        let status_item = MenuItem::new(
+            format!("● {} — {}", cfg.app_name, initial_label),
+            false,
+            None,
+        );
         let id_item = MenuItem::new(format!("id: {}", cfg.local_id), false, None);
         let fp_item = MenuItem::new("Show fingerprint…", true, None);
         let log_item = MenuItem::new("Open log folder", log_dir.is_some(), None);
@@ -197,7 +208,7 @@ mod platform {
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip(format!("{} — Local", cfg.app_name))
+            .with_tooltip(format!("{} — {}", cfg.app_name, initial_label))
             .with_icon(load_icon(MODE_LOCAL))
             .build()?;
 
@@ -254,7 +265,11 @@ mod platform {
                 } else if me.id == edit_cfg_id {
                     if editor_events.is_none() {
                         if let Some(path) = &config_path {
-                            match editor::launch(path.clone(), app_name.clone(), session_active.clone()) {
+                            match editor::launch(
+                                path.clone(),
+                                app_name.clone(),
+                                session_active.clone(),
+                            ) {
                                 Ok(events) => editor_events = Some(events),
                                 Err(error) => show_message(
                                     &format!("{} config", app_name),

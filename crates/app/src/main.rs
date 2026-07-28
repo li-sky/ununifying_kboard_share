@@ -5,7 +5,7 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use kbshare_core::codec::LineDecoder;
-use kbshare_core::protocol::Message;
+use kbshare_core::protocol::{Message, PROTOCOL_VERSION};
 use kbshare_core::runtime::{ClientDriver, ClientStep, HostDriver, Step};
 use kbshare_core::state::{Mode, SideEffect};
 use kbshare_net::cert::{fingerprint_hex, load_or_create_cert};
@@ -62,13 +62,27 @@ struct Config {
     flow_lite: kbshare_flow::FlowLiteConfig,
 }
 
-fn default_tcp_port() -> u16 { 5005 }
-fn default_cert() -> PathBuf { PathBuf::from("certs/kbshare_cert.pem") }
-fn default_key() -> PathBuf { PathBuf::from("certs/kbshare_key.pem") }
-fn default_trust() -> PathBuf { PathBuf::from("trust.json") }
-fn default_reconnect_secs() -> u64 { 3 }
-fn default_heartbeat_secs() -> f32 { 1.0 }
-fn default_idle_secs() -> f32 { 3.0 }
+fn default_tcp_port() -> u16 {
+    5005
+}
+fn default_cert() -> PathBuf {
+    PathBuf::from("certs/kbshare_cert.pem")
+}
+fn default_key() -> PathBuf {
+    PathBuf::from("certs/kbshare_key.pem")
+}
+fn default_trust() -> PathBuf {
+    PathBuf::from("trust.json")
+}
+fn default_reconnect_secs() -> u64 {
+    3
+}
+fn default_heartbeat_secs() -> f32 {
+    1.0
+}
+fn default_idle_secs() -> f32 {
+    3.0
+}
 
 #[derive(Debug, Clone)]
 struct RuntimePaths {
@@ -89,6 +103,13 @@ struct SessionCtx {
     stream: SharedStream,
 }
 type SessionSlot = Arc<Mutex<Option<SessionCtx>>>;
+
+#[derive(Debug, Clone)]
+struct LocalMouseInfo {
+    fingerprint: Option<Vec<u8>>,
+    current_host: u8,
+    slot: Option<u8>,
+}
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -142,12 +163,10 @@ fn run(paths: RuntimePaths) -> Result<()> {
         }
     }
 
-    cfg.flow_lite
-        .ensure_layout(&cfg.local_id, &cfg.remote_id, kbshare_flow::FlowRole::Host);
-
     let bundle = load_or_create_cert(&cfg.cert_file, &cfg.key_file, &cfg.local_id)?;
     let our_fp = fingerprint_hex(&bundle.cert_der);
     tracing::info!(id = %cfg.local_id, peer = %cfg.remote_id, fingerprint = %our_fp, "kbshare peer starting");
+    report_local_node(&cfg);
 
     let mode_flag = Arc::new(AtomicU8::new(MODE_LOCAL));
     let session_active = Arc::new(AtomicBool::new(false));
@@ -159,26 +178,58 @@ fn run(paths: RuntimePaths) -> Result<()> {
         config_path: Some(paths.config_path.clone()),
         config_dir: Some(paths.config_dir.clone()),
         log_dir: Some(paths.log_dir.clone()),
+        waiting_for_peer: cfg.remote_id.trim().is_empty(),
     };
 
+    if cfg.remote_id.trim().is_empty() {
+        tracing::info!("local node is registered; waiting for a peer to be selected");
+        let tray_exit =
+            kbshare_tray::run_tray(tray_cfg, mode_flag, session_active, shutdown.clone())?;
+        shutdown.store(true, Ordering::Relaxed);
+        return match tray_exit {
+            TrayExit::ReloadConfig(path) => relaunch_with_config(&path),
+            TrayExit::Quit => Ok(()),
+        };
+    }
+
+    let flow_role = if cfg.local_id < cfg.remote_id {
+        kbshare_flow::FlowRole::Host
+    } else {
+        kbshare_flow::FlowRole::Client
+    };
+    cfg.flow_lite
+        .ensure_layout(&cfg.local_id, &cfg.remote_id, flow_role);
     let client_tls = build_client_config(&bundle)?;
     let server_tls = build_server_config(&bundle)?;
     let engine_shutdown = shutdown.clone();
     let engine_mode = mode_flag.clone();
     let engine_session = session_active.clone();
     let engine_config = paths.config_path.clone();
-    let engine = std::thread::Builder::new().name("peer-engine".into()).spawn(move || {
-        let result = run_engine(cfg, our_fp, client_tls, server_tls, engine_config, engine_mode, engine_session, engine_shutdown.clone());
-        if let Err(error) = &result {
-            tracing::error!(error = %error, "peer engine exited");
-            engine_shutdown.store(true, Ordering::Relaxed);
-        }
-        result
-    })?;
+    let engine = std::thread::Builder::new()
+        .name("peer-engine".into())
+        .spawn(move || {
+            let result = run_engine(
+                cfg,
+                our_fp,
+                client_tls,
+                server_tls,
+                engine_config,
+                engine_mode,
+                engine_session,
+                engine_shutdown.clone(),
+            );
+            if let Err(error) = &result {
+                tracing::error!(error = %error, "peer engine exited");
+                engine_shutdown.store(true, Ordering::Relaxed);
+            }
+            result
+        })?;
 
     let tray_exit = kbshare_tray::run_tray(tray_cfg, mode_flag, session_active, shutdown.clone())?;
     shutdown.store(true, Ordering::Relaxed);
-    let engine_result = engine.join().map_err(|_| anyhow!("peer engine thread panicked"))?;
+    let engine_result = engine
+        .join()
+        .map_err(|_| anyhow!("peer engine thread panicked"))?;
     match tray_exit {
         TrayExit::ReloadConfig(path) => {
             relaunch_with_config(&path)?;
@@ -237,12 +288,18 @@ fn run_engine(
         let remote_id = cfg.remote_id.clone();
         mouse.start(Box::new(move |activity| {
             let mut guard = slot.lock();
-            let Some(ctx) = guard.as_mut() else { return; };
+            let Some(ctx) = guard.as_mut() else {
+                return;
+            };
             let flow_config = flow.lock().clone();
             let target = flow_config.target_for_peer(&local_id, &remote_id);
             if flow_config.enabled
                 && ctx.outbound.mode() == Mode::Local
-                && target.map(|target| activity_hits_edge(activity, target.edge, flow_config.edge_px.max(0))).unwrap_or(false)
+                && target
+                    .map(|target| {
+                        activity_hits_edge(activity, target.edge, flow_config.edge_px.max(0))
+                    })
+                    .unwrap_or(false)
             {
                 let target = target.expect("edge target checked");
                 match kbshare_flow::switch_host(flow_config.slot, target.host_index) {
@@ -273,24 +330,58 @@ fn run_engine(
         let mouse_tick = mouse_tick.clone();
         let shutdown = shutdown.clone();
         let interval = Duration::from_secs_f32(cfg.heartbeat_secs.max(0.05));
-        std::thread::Builder::new().name("peer-heartbeat".into()).spawn(move || {
-            while !shutdown.load(Ordering::Relaxed) {
-                std::thread::sleep(interval);
-                let mut guard = slot.lock();
-                if let Some(ctx) = guard.as_mut() {
-                    let active = mouse_tick.swap(false, Ordering::Relaxed)
-                        && ctx.outbound.mode() == Mode::Local;
-                    let step = if active { ctx.inbound.on_local_mouse_active() } else { ctx.inbound.on_local_mouse_idle() };
-                    let _ = apply_client_step(&ctx.stream, &injector, &step);
+        std::thread::Builder::new()
+            .name("peer-heartbeat".into())
+            .spawn(move || {
+                while !shutdown.load(Ordering::Relaxed) {
+                    std::thread::sleep(interval);
+                    let mut guard = slot.lock();
+                    if let Some(ctx) = guard.as_mut() {
+                        let active = mouse_tick.swap(false, Ordering::Relaxed)
+                            && ctx.outbound.mode() == Mode::Local;
+                        let step = if active {
+                            ctx.inbound.on_local_mouse_active()
+                        } else {
+                            ctx.inbound.on_local_mouse_idle()
+                        };
+                        let _ = apply_client_step(&ctx.stream, &injector, &step);
+                    }
                 }
-            }
-        })?;
+            })?;
     }
 
     if cfg.local_id < cfg.remote_id {
-        run_dialer(&cfg, &our_fp, client_tls, &trust, policy, &slot, &injector, &forwarding, &mode_flag, &session_active, &shutdown, &flow, &config_path)
+        run_dialer(
+            &cfg,
+            &our_fp,
+            client_tls,
+            &trust,
+            policy,
+            &slot,
+            &injector,
+            &forwarding,
+            &mode_flag,
+            &session_active,
+            &shutdown,
+            &flow,
+            &config_path,
+        )
     } else {
-        run_listener(&cfg, &our_fp, server_tls, &trust, policy, &slot, &injector, &forwarding, &mode_flag, &session_active, &shutdown, &flow, &config_path)
+        run_listener(
+            &cfg,
+            &our_fp,
+            server_tls,
+            &trust,
+            policy,
+            &slot,
+            &injector,
+            &forwarding,
+            &mode_flag,
+            &session_active,
+            &shutdown,
+            &flow,
+            &config_path,
+        )
     }
 }
 
@@ -314,19 +405,40 @@ fn run_dialer(
         let mut attempted = false;
         for addr in resolve_peer_addrs(cfg) {
             attempted = true;
-            if shutdown.load(Ordering::Relaxed) { return Ok(()); }
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let result = (|| -> Result<()> {
-                let socket = addr.parse().with_context(|| format!("parse peer address {addr}"))?;
+                let socket = addr
+                    .parse()
+                    .with_context(|| format!("parse peer address {addr}"))?;
                 let tcp = TcpStream::connect_timeout(&socket, Duration::from_secs(5))?;
                 prepare_tcp(&tcp)?;
                 let (stream, peer_fp) = client_handshake(tcp, tls.clone(), &cfg.remote_id)?;
-                run_session(cfg, our_fp, Box::new(stream), Some(peer_fp), trust, policy, slot, injector, forwarding, mode_flag, session_active, shutdown, flow, config_path)
+                run_session(
+                    cfg,
+                    our_fp,
+                    Box::new(stream),
+                    Some(peer_fp),
+                    trust,
+                    policy,
+                    slot,
+                    injector,
+                    forwarding,
+                    mode_flag,
+                    session_active,
+                    shutdown,
+                    flow,
+                    config_path,
+                )
             })();
             if let Err(error) = result {
                 tracing::warn!(%addr, error = %error, "peer session ended");
             }
         }
-        if !attempted { tracing::warn!("no peer address discovered; waiting"); }
+        if !attempted {
+            tracing::warn!("no peer address discovered; waiting");
+        }
         sleep_or_stop(Duration::from_secs(cfg.reconnect_secs), shutdown);
     }
     Ok(())
@@ -351,7 +463,6 @@ fn run_listener(
     let bind = format!("0.0.0.0:{}", cfg.tcp_port);
     let listener = TcpListener::bind(&bind).with_context(|| format!("bind {bind}"))?;
     listener.set_nonblocking(true)?;
-    report_local_node(cfg);
     tracing::info!(%bind, "waiting for peer");
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -360,11 +471,30 @@ fn run_listener(
                 tracing::info!(%address, "peer connected");
                 let result = (|| -> Result<()> {
                     let (stream, _) = server_handshake(tcp, tls.clone())?;
-                    run_session(cfg, our_fp, Box::new(stream), None, trust, policy, slot, injector, forwarding, mode_flag, session_active, shutdown, flow, config_path)
+                    run_session(
+                        cfg,
+                        our_fp,
+                        Box::new(stream),
+                        None,
+                        trust,
+                        policy,
+                        slot,
+                        injector,
+                        forwarding,
+                        mode_flag,
+                        session_active,
+                        shutdown,
+                        flow,
+                        config_path,
+                    )
                 })();
-                if let Err(error) = result { tracing::warn!(error = %error, "peer session ended"); }
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "peer session ended");
+                }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
             Err(error) => tracing::warn!(error = %error, "accept failed"),
         }
     }
@@ -395,14 +525,38 @@ fn run_session(
     let _ = inbound.on_session_established();
     apply_host_effects(&hello, forwarding, mode_flag);
     send_host_step(&stream, &hello)?;
-    send_one(&stream, &Message::FlowLayout { id: cfg.local_id.clone(), layout: flow.lock().layout.clone() })?;
-    *slot.lock() = Some(SessionCtx { outbound, inbound, stream: stream.clone() });
+    let local_mouse = inspect_local_mouse(&cfg.local_id);
+    if let Some(info) = &local_mouse {
+        send_one(
+            &stream,
+            &Message::MouseInfo {
+                id: cfg.local_id.clone(),
+                fingerprint: info.fingerprint.clone(),
+                current_host: info.current_host,
+                slot: info.slot,
+            },
+        )?;
+    }
+    send_one(
+        &stream,
+        &Message::FlowLayout {
+            id: cfg.local_id.clone(),
+            layout: flow.lock().layout.clone(),
+        },
+    )?;
+    *slot.lock() = Some(SessionCtx {
+        outbound,
+        inbound,
+        stream: stream.clone(),
+    });
     session_active.store(true, Ordering::Relaxed);
 
     let mut verified = false;
     let mut decoder = LineDecoder::new();
     let result = loop {
-        if shutdown.load(Ordering::Relaxed) { break Ok(()); }
+        if shutdown.load(Ordering::Relaxed) {
+            break Ok(());
+        }
         let incoming = {
             let mut reader = stream.lock();
             match recv_message(&mut *reader, &mut decoder) {
@@ -411,31 +565,105 @@ fn run_session(
                 Err(error) => break Err(error),
             }
         };
-        let Some(message) = incoming else { continue; };
+        let Some(message) = incoming else {
+            continue;
+        };
         if !verified {
-            let Message::Hello { id, fingerprint, .. } = &message else {
+            let Message::Hello {
+                id,
+                fingerprint,
+                version,
+            } = &message
+            else {
                 break Err(anyhow!("first peer message must be Hello"));
             };
-            if id != &cfg.remote_id { break Err(anyhow!("peer id {id} != configured {}", cfg.remote_id)); }
-            if tls_peer_fp.as_ref().is_some_and(|actual| actual != fingerprint) {
-                break Err(anyhow!("peer Hello fingerprint does not match TLS certificate"));
+            if id != &cfg.remote_id {
+                break Err(anyhow!("peer id {id} != configured {}", cfg.remote_id));
+            }
+            if *version != PROTOCOL_VERSION {
+                break Err(anyhow!(
+                    "peer protocol version {version} != local {PROTOCOL_VERSION}"
+                ));
+            }
+            if tls_peer_fp
+                .as_ref()
+                .is_some_and(|actual| actual != fingerprint)
+            {
+                break Err(anyhow!(
+                    "peer Hello fingerprint does not match TLS certificate"
+                ));
             }
             verify_trust(trust, policy, id, fingerprint)?;
             verified = true;
         }
 
+        if let Message::MouseInfo {
+            id,
+            fingerprint,
+            current_host,
+            slot: _,
+        } = &message
+        {
+            if id != &cfg.remote_id {
+                continue;
+            }
+            if let Some(local) = &local_mouse {
+                let updated_flow = {
+                    let mut flow_config = flow.lock();
+                    auto_configure_flow_lite(
+                        &mut flow_config,
+                        &cfg.local_id,
+                        &cfg.remote_id,
+                        local,
+                        fingerprint.as_deref(),
+                        *current_host,
+                    )
+                    .then(|| flow_config.clone())
+                };
+                if let Some(updated_flow) = updated_flow {
+                    kbshare_flow::persist_flow_lite(config_path, &updated_flow)?;
+                    send_one(
+                        &stream,
+                        &Message::FlowLayout {
+                            id: cfg.local_id.clone(),
+                            layout: updated_flow.layout,
+                        },
+                    )?;
+                    tracing::info!(
+                        peer = %cfg.remote_id,
+                        local_host = local.current_host,
+                        remote_host = *current_host,
+                        "matching mouse fingerprint detected; Flow-lite configured"
+                    );
+                }
+            }
+            continue;
+        }
+
         if let Message::FlowLayout { id, layout } = &message {
-            if id != &cfg.remote_id { continue; }
+            if id != &cfg.remote_id {
+                continue;
+            }
             match kbshare_flow::reconcile_layout(&mut flow.lock().layout, layout) {
-                kbshare_flow::LayoutReconcile::AppliedRemote => kbshare_flow::persist_layout(config_path, layout)?,
-                kbshare_flow::LayoutReconcile::SendLocal(layout) => send_one(&stream, &Message::FlowLayout { id: cfg.local_id.clone(), layout })?,
+                kbshare_flow::LayoutReconcile::AppliedRemote => {
+                    kbshare_flow::persist_layout(config_path, layout)?
+                }
+                kbshare_flow::LayoutReconcile::SendLocal(layout) => send_one(
+                    &stream,
+                    &Message::FlowLayout {
+                        id: cfg.local_id.clone(),
+                        layout,
+                    },
+                )?,
                 kbshare_flow::LayoutReconcile::Equal => {}
             }
             continue;
         }
 
         let mut guard = slot.lock();
-        let Some(ctx) = guard.as_mut() else { break Ok(()); };
+        let Some(ctx) = guard.as_mut() else {
+            break Ok(());
+        };
         let host_step = ctx.outbound.on_incoming(message.clone());
         apply_host_effects(&host_step, forwarding, mode_flag);
         send_host_step(&ctx.stream, &host_step)?;
@@ -457,12 +685,21 @@ fn run_session(
     result
 }
 
-fn verify_trust(trust: &TrustStore, policy: AutoTrustPolicy, id: &str, fingerprint: &str) -> Result<()> {
+fn verify_trust(
+    trust: &TrustStore,
+    policy: AutoTrustPolicy,
+    id: &str,
+    fingerprint: &str,
+) -> Result<()> {
     match trust.evaluate(id, fingerprint) {
         TrustDecision::KnownAndMatches => Ok(()),
-        TrustDecision::Unknown if matches!(policy, AutoTrustPolicy::TrustOnFirstUse) => trust.learn(id, fingerprint),
+        TrustDecision::Unknown if matches!(policy, AutoTrustPolicy::TrustOnFirstUse) => {
+            trust.learn(id, fingerprint)
+        }
         TrustDecision::Unknown => Err(anyhow!("unknown peer fingerprint {fingerprint}")),
-        TrustDecision::Mismatch { expected, actual } => Err(anyhow!("peer fingerprint mismatch: expected {expected}, got {actual}")),
+        TrustDecision::Mismatch { expected, actual } => Err(anyhow!(
+            "peer fingerprint mismatch: expected {expected}, got {actual}"
+        )),
     }
 }
 
@@ -471,21 +708,136 @@ fn resolve_peer_addrs(cfg: &Config) -> Vec<String> {
         if let Ok(entry) = RegistryClient::new(base).lookup(&cfg.remote_id) {
             if !entry.ips.is_empty() {
                 let port = entry.tcp_port.unwrap_or(cfg.tcp_port);
-                return entry.ips.into_iter().map(|ip| format!("{ip}:{port}")).collect();
+                return entry
+                    .ips
+                    .into_iter()
+                    .map(|ip| format!("{ip}:{port}"))
+                    .collect();
             }
         }
     }
-    cfg.fallback_remote_ips.iter().map(|ip| format!("{ip}:{}", cfg.tcp_port)).collect()
+    cfg.fallback_remote_ips
+        .iter()
+        .map(|ip| format!("{ip}:{}", cfg.tcp_port))
+        .collect()
 }
 
 fn report_local_node(cfg: &Config) {
-    let Some(base) = &cfg.vps_base_url else { return; };
+    let Some(base) = &cfg.vps_base_url else {
+        return;
+    };
     let ips = local_ip().into_iter().collect::<Vec<_>>();
-    if ips.is_empty() { tracing::warn!("could not determine local IP for discovery report"); return; }
-    let report = NodeReport { node_id: cfg.local_id.clone(), ips, tcp_port: Some(cfg.tcp_port), udp_port: None, event: "online".into() };
+    if ips.is_empty() {
+        tracing::warn!("could not determine local IP for discovery report");
+        return;
+    }
+    let report = NodeReport {
+        node_id: cfg.local_id.clone(),
+        ips,
+        tcp_port: Some(cfg.tcp_port),
+        udp_port: None,
+        event: "online".into(),
+    };
     if let Err(error) = RegistryClient::new(base).report(&report) {
         tracing::warn!(error = %error, "cloud discovery report failed");
     }
+}
+
+fn inspect_local_mouse(local_id: &str) -> Option<LocalMouseInfo> {
+    match kbshare_flow::inspect_with_fingerprint() {
+        Ok(devices) => {
+            let device = devices.into_iter().find(|device| device.is_mouse())?;
+            let slot = matches!(device.connection, kbshare_flow::ConnectionType::Receiver)
+                .then_some(device.slot);
+            if device.fingerprint.is_none() {
+                tracing::warn!(id = %local_id, "mouse detected without feature 0x0003 fingerprint");
+            }
+            Some(LocalMouseInfo {
+                fingerprint: device.fingerprint.map(Vec::from),
+                current_host: device.current_host,
+                slot,
+            })
+        }
+        Err(error) => {
+            tracing::warn!(id = %local_id, error = %error, "could not inspect local mouse");
+            None
+        }
+    }
+}
+
+fn auto_configure_flow_lite(
+    flow: &mut kbshare_flow::FlowLiteConfig,
+    local_id: &str,
+    remote_id: &str,
+    local: &LocalMouseInfo,
+    remote_fingerprint: Option<&[u8]>,
+    remote_host: u8,
+) -> bool {
+    let (Some(local_fingerprint), Some(remote_fingerprint)) =
+        (local.fingerprint.as_deref(), remote_fingerprint)
+    else {
+        return false;
+    };
+    if local_fingerprint.len() != 16
+        || remote_fingerprint.len() != 16
+        || local_fingerprint != remote_fingerprint
+    {
+        tracing::info!(peer = %remote_id, "mouse fingerprints do not match; Flow-lite remains unchanged");
+        return false;
+    }
+
+    let fingerprint =
+        <[u8; 16]>::try_from(local_fingerprint).expect("fingerprint length checked above");
+    let mut changed = !flow.enabled
+        || flow.slot != local.slot
+        || flow.local_host != local.current_host
+        || flow.remote_host != remote_host
+        || flow.fingerprint != Some(fingerprint);
+    flow.enabled = true;
+    flow.slot = local.slot;
+    flow.local_host = local.current_host;
+    flow.remote_host = remote_host;
+    flow.fingerprint = Some(fingerprint);
+
+    let local_x = 180 + i32::from(local.current_host.min(2)) * 320;
+    let remote_x = 180 + i32::from(remote_host.min(2)) * 320;
+    changed |= upsert_layout_device(&mut flow.layout, local_id, local.current_host, local_x);
+    changed |= upsert_layout_device(&mut flow.layout, remote_id, remote_host, remote_x);
+    if changed {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        flow.layout.version = now.max(flow.layout.version.saturating_add(1));
+        flow.layout.updated_by = local_id.to_string();
+    }
+    changed
+}
+
+fn upsert_layout_device(
+    layout: &mut kbshare_flow::FlowLayout,
+    id: &str,
+    host_index: u8,
+    default_x: i32,
+) -> bool {
+    let auto_seed = layout.version == 0;
+    if let Some(device) = layout.devices.iter_mut().find(|device| device.id == id) {
+        let changed = device.host_index != host_index || (auto_seed && device.x != default_x);
+        device.host_index = host_index;
+        if auto_seed {
+            device.x = default_x;
+            device.y = 500;
+        }
+        return changed;
+    }
+    layout.devices.push(kbshare_flow::FlowLayoutDevice {
+        id: id.to_string(),
+        label: id.to_string(),
+        host_index,
+        x: default_x,
+        y: 500,
+    });
+    true
 }
 
 fn local_ip() -> Option<String> {
@@ -508,12 +860,20 @@ fn send_one(stream: &SharedStream, message: &Message) -> Result<()> {
 }
 
 fn send_host_step(stream: &SharedStream, step: &Step) -> Result<()> {
-    for message in &step.outgoing { send_one(stream, message)?; }
+    for message in &step.outgoing {
+        send_one(stream, message)?;
+    }
     Ok(())
 }
 
-fn apply_client_step(stream: &SharedStream, injector: &SharedInjector, step: &ClientStep) -> Result<()> {
-    for message in &step.outgoing { send_one(stream, message)?; }
+fn apply_client_step(
+    stream: &SharedStream,
+    injector: &SharedInjector,
+    step: &ClientStep,
+) -> Result<()> {
+    for message in &step.outgoing {
+        send_one(stream, message)?;
+    }
     for (action, key) in &step.inject {
         let mut injector = injector.lock();
         match action {
@@ -529,13 +889,24 @@ fn apply_host_effects(step: &Step, forwarding: &Arc<AtomicBool>, mode_flag: &Arc
         match effect {
             SideEffect::StartForwardingKeyboard => forwarding.store(true, Ordering::Relaxed),
             SideEffect::ResumeLocalKeyboard => forwarding.store(false, Ordering::Relaxed),
-            SideEffect::Notify(mode) => mode_flag.store(if *mode == Mode::Remote { MODE_REMOTE } else { MODE_LOCAL }, Ordering::Relaxed),
+            SideEffect::Notify(mode) => mode_flag.store(
+                if *mode == Mode::Remote {
+                    MODE_REMOTE
+                } else {
+                    MODE_LOCAL
+                },
+                Ordering::Relaxed,
+            ),
             _ => {}
         }
     }
 }
 
-fn activity_hits_edge(activity: MouseActivity, edge: kbshare_flow::FlowEdge, threshold: i32) -> bool {
+fn activity_hits_edge(
+    activity: MouseActivity,
+    edge: kbshare_flow::FlowEdge,
+    threshold: i32,
+) -> bool {
     match edge {
         kbshare_flow::FlowEdge::Left => activity.at_left_edge(threshold),
         kbshare_flow::FlowEdge::Right => activity.at_right_edge(threshold),
@@ -559,19 +930,37 @@ fn is_timeout(error: &anyhow::Error) -> bool {
 }
 
 fn resolve_runtime_paths(config_arg: &Path) -> Result<RuntimePaths> {
-    let config_path = if config_arg.is_absolute() { config_arg.to_path_buf() } else { std::env::current_dir()?.join(config_arg) };
-    let config_dir = config_path.parent().map(Path::to_path_buf).unwrap_or(std::env::current_dir()?);
-    let log_dir = if config_dir.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("runtime_")) {
+    let config_path = if config_arg.is_absolute() {
+        config_arg.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(config_arg)
+    };
+    let config_dir = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(std::env::current_dir()?);
+    let log_dir = if config_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("runtime_"))
+    {
         config_dir.parent().unwrap_or(&config_dir).join("logs")
     } else {
         config_dir.join("logs")
     };
-    Ok(RuntimePaths { log_file: log_dir.join("kbshare.log"), config_path, config_dir, log_dir })
+    Ok(RuntimePaths {
+        log_file: log_dir.join("kbshare.log"),
+        config_path,
+        config_dir,
+        log_dir,
+    })
 }
 
 fn resolve_config_paths(cfg: &mut Config, config_dir: &Path) {
     for path in [&mut cfg.cert_file, &mut cfg.key_file, &mut cfg.trust_store] {
-        if path.is_relative() { *path = config_dir.join(&*path); }
+        if path.is_relative() {
+            *path = config_dir.join(&*path);
+        }
     }
 }
 
@@ -590,13 +979,21 @@ fn load_config(path: &Path) -> Result<Config> {
 }
 
 fn init_logging(log_file: &Path) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    let log_dir = log_file.parent().ok_or_else(|| anyhow!("missing log directory"))?;
+    let log_dir = log_file
+        .parent()
+        .ok_or_else(|| anyhow!("missing log directory"))?;
     std::fs::create_dir_all(log_dir)?;
-    let name = log_file.file_name().and_then(|name| name.to_str()).ok_or_else(|| anyhow!("invalid log filename"))?;
+    let name = log_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid log filename"))?;
     let appender = tracing_appender::rolling::never(log_dir, name);
     let (writer, guard) = tracing_appender::non_blocking(appender);
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .with_writer(writer)
         .with_ansi(false)
         .init();
@@ -607,7 +1004,92 @@ fn relaunch_with_config(config_path: &Path) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut command = Command::new(exe);
     command.arg("--config").arg(config_path);
-    if let Some(dir) = config_path.parent() { command.current_dir(dir); }
+    if let Some(dir) = config_path.parent() {
+        command.current_dir(dir);
+    }
     command.spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local_mouse(fingerprint: [u8; 16]) -> LocalMouseInfo {
+        LocalMouseInfo {
+            fingerprint: Some(fingerprint.to_vec()),
+            current_host: 0,
+            slot: Some(2),
+        }
+    }
+
+    #[test]
+    fn matching_fingerprint_enables_flow_and_builds_layout() {
+        let fingerprint = [7; 16];
+        let mut flow = kbshare_flow::FlowLiteConfig::default();
+        assert!(auto_configure_flow_lite(
+            &mut flow,
+            "alpha",
+            "beta",
+            &local_mouse(fingerprint),
+            Some(&fingerprint),
+            2,
+        ));
+        assert!(flow.enabled);
+        assert_eq!(flow.slot, Some(2));
+        assert_eq!(flow.local_host, 0);
+        assert_eq!(flow.remote_host, 2);
+        assert_eq!(flow.fingerprint, Some(fingerprint));
+        assert_eq!(flow.layout.devices.len(), 2);
+        assert_eq!(flow.layout.devices[0].id, "alpha");
+        assert_eq!(flow.layout.devices[1].id, "beta");
+    }
+
+    #[test]
+    fn mismatched_fingerprint_does_not_change_flow() {
+        let mut flow = kbshare_flow::FlowLiteConfig::default();
+        assert!(!auto_configure_flow_lite(
+            &mut flow,
+            "alpha",
+            "beta",
+            &local_mouse([1; 16]),
+            Some(&[2; 16]),
+            2,
+        ));
+        assert!(!flow.enabled);
+        assert!(flow.layout.devices.is_empty());
+    }
+
+    #[test]
+    fn later_matching_peer_is_added_without_dropping_existing_devices() {
+        let fingerprint = [9; 16];
+        let local = local_mouse(fingerprint);
+        let mut flow = kbshare_flow::FlowLiteConfig::default();
+        assert!(auto_configure_flow_lite(
+            &mut flow,
+            "alpha",
+            "beta",
+            &local,
+            Some(&fingerprint),
+            2,
+        ));
+        assert!(auto_configure_flow_lite(
+            &mut flow,
+            "alpha",
+            "gamma",
+            &local,
+            Some(&fingerprint),
+            1,
+        ));
+        assert_eq!(flow.layout.devices.len(), 3);
+        let gamma = flow
+            .layout
+            .devices
+            .iter()
+            .find(|device| device.id == "gamma")
+            .unwrap();
+        assert_eq!(gamma.host_index, 1);
+        assert_eq!(gamma.x, 500);
+        assert!(flow.layout.devices.iter().any(|device| device.id == "beta"));
+    }
 }
