@@ -56,7 +56,7 @@ struct Config {
     heartbeat_secs: f32,
     #[serde(default = "default_idle_secs")]
     idle_after_secs: f32,
-    #[serde(default)]
+    #[serde(default = "default_auto_trust_first_seen")]
     auto_trust_first_seen: bool,
     #[serde(default)]
     flow_lite: kbshare_flow::FlowLiteConfig,
@@ -82,6 +82,9 @@ fn default_heartbeat_secs() -> f32 {
 }
 fn default_idle_secs() -> f32 {
     3.0
+}
+fn default_auto_trust_first_seen() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -1021,6 +1024,16 @@ mod tests {
             current_host: 0,
             slot: Some(2),
         }
+    }
+
+    #[test]
+    fn configurations_without_trust_setting_use_tofu() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "local_id": "alpha",
+            "remote_id": "beta"
+        }))
+        .unwrap();
+        assert!(config.auto_trust_first_seen);
     }
 
     #[test]
