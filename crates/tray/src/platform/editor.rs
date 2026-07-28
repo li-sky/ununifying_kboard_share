@@ -393,7 +393,6 @@ fn validate_layout(config: &Value) -> Result<()> {
     else {
         return Ok(());
     };
-    let local_id = config["local_id"].as_str().unwrap_or_default();
     let mut ids = std::collections::HashSet::new();
     for device in devices {
         let id = device["id"].as_str().unwrap_or_default().trim();
@@ -417,9 +416,6 @@ fn validate_layout(config: &Value) -> Result<()> {
                 bail!("device {id} coordinate {coordinate} must be between 0 and 1000");
             }
         }
-    }
-    if !local_id.is_empty() && !ids.contains(local_id) {
-        bail!("Flow layout must contain local_id");
     }
     Ok(())
 }
@@ -910,6 +906,28 @@ mod tests {
         let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved["local_id"], "desktop");
         assert_eq!(saved["remote_id"], "");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn save_allows_stale_layout_until_automatic_detection_rebuilds_it() {
+        let path = std::env::temp_dir().join(format!(
+            "kbshare-editor-stale-layout-{}.json",
+            std::process::id()
+        ));
+        save_config(
+            &path,
+            br#"{
+                "local_id":"new-desktop",
+                "remote_id":"",
+                "flow_lite":{"layout":{"devices":[
+                    {"id":"old-desktop","host_index":0,"x":180,"y":500}
+                ]}}
+            }"#,
+        )
+        .unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["local_id"], "new-desktop");
         std::fs::remove_file(path).unwrap();
     }
 
