@@ -211,9 +211,14 @@ fn serve(
                 respond_json_result(&mut stream, result)?;
             }
             Ok(request) if request.method == "GET" && request.path == format!("{route}/status") => {
+                let live_config = std::fs::read(config_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
                 let body = serde_json::json!({
                     "ok": true,
                     "connected": session_active.load(Ordering::Relaxed),
+                    "flow_lite": live_config.get("flow_lite").cloned(),
                 });
                 respond(
                     &mut stream,
@@ -806,16 +811,19 @@ const PAGE_V2: &str = r#"<!doctype html>
     cfg.remote_id??=""; cfg.flow_lite??={}; cfg.tcp_port??=5005; cfg.auto_trust_first_seen??=true;
     function setStatus(message,error=false,ok=false){$("status").textContent=message;$("status").className=error?"error":ok?"ok":"";}
     function fingerprint(value){return Array.isArray(value)&&value.length?value.map(byte=>Number(byte).toString(16).padStart(2,"0")).join(""):"—";}
+    function renderFlow(){
+      const f=cfg.flow_lite??{};$("flow_enabled").textContent=f.enabled?"Enabled · fingerprint matched":f.fingerprint?"Mouse detected · waiting for peer match":"Not detected";$("flow_slot").textContent=f.slot??"Bluetooth / direct / unknown";$("flow_local_host").textContent=f.fingerprint?`Channel ${Number(f.local_host)+1}`:"—";$("flow_remote_host").textContent=f.enabled?`Channel ${Number(f.remote_host)+1}`:"—";$("flow_fingerprint").textContent=fingerprint(f.fingerprint);
+      const devices=f.layout?.devices??[];$("layout_devices").innerHTML=devices.length?devices.map(d=>`<li>${escapeHtml(d.label||d.id)} — channel ${Number(d.host_index)+1}</li>`).join(""):"<li>No matched machines yet.</li>";
+    }
     function render(){
       $("local_id").value=cfg.local_id??"";$("remote_id").value=cfg.remote_id??"";$("registry_url").value=cfg.vps_base_url??"";$("tcp_port").value=cfg.tcp_port??5005;$("auto_trust_first_seen").checked=!!cfg.auto_trust_first_seen;
-      const f=cfg.flow_lite??{};$("flow_enabled").textContent=f.enabled?"Enabled · fingerprint matched":"Not detected";$("flow_slot").textContent=f.slot??"Bluetooth / direct / unknown";$("flow_local_host").textContent=f.enabled?`Channel ${Number(f.local_host)+1}`:"—";$("flow_remote_host").textContent=f.enabled?`Channel ${Number(f.remote_host)+1}`:"—";$("flow_fingerprint").textContent=fingerprint(f.fingerprint);
-      const devices=f.layout?.devices??[];$("layout_devices").innerHTML=devices.length?devices.map(d=>`<li>${escapeHtml(d.label||d.id)} — channel ${Number(d.host_index)+1}</li>`).join(""):"<li>No matched machines yet.</li>";
+      renderFlow();
       $("raw").value=JSON.stringify(cfg,null,2);renderConnection();
     }
     function escapeHtml(value){const node=document.createElement("span");node.textContent=value;return node.innerHTML;}
     function collect(){cfg.local_id=$("local_id").value.trim();cfg.remote_id=$("remote_id").value.trim();cfg.tcp_port=Number($("tcp_port").value);cfg.auto_trust_first_seen=$("auto_trust_first_seen").checked;const registry=$("registry_url").value.trim();if(registry)cfg.vps_base_url=registry;else delete cfg.vps_base_url;$("raw").value=JSON.stringify(cfg,null,2);return cfg;}
     function renderConnection(){const peer=cfg.remote_id?.trim();$("connection_title").textContent=connected?`Connected to ${peer||"peer"}`:peer?`Configured for ${peer}`:"Registered · waiting for connection";$("connection_detail").textContent=peer?(connected?"Secure session active":"The app will resolve this peer through the registry."):"Choose a registered machine below.";$("connection_badge").textContent=connected?"Connected":peer?"Configured":"Waiting";}
-    async function pollStatus(){try{const r=await fetch(statusRoute),out=await r.json();if(out.ok){connected=!!out.connected;renderConnection();}}catch(_){}}
+    async function pollStatus(){try{const r=await fetch(statusRoute),out=await r.json();if(out.ok){connected=!!out.connected;if(out.flow_lite)cfg.flow_lite=out.flow_lite;renderConnection();renderFlow();}}catch(_){}}
     async function save(data,button){if(!data.local_id)throw new Error("This machine must be registered first");button.disabled=true;setStatus("Saving…");try{const r=await fetch(saveRoute,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Save failed");setStatus("Saved. Restarting application…",false,true);}catch(error){button.disabled=false;setStatus(error.message,true);throw error;}}
     async function loadNodes(){const button=$("refresh_nodes"),list=$("node_list"),base=$("registry_url").value.trim();if(!base){setStatus("Enter the registry endpoint first",true);return;}button.disabled=true;list.innerHTML='<div class="empty">Loading registered nodes…</div>';try{const r=await fetch(nodesRoute,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({base_url:base})}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Could not load nodes");const nodes=out.nodes.filter(node=>node.node_id!==cfg.local_id);list.innerHTML=nodes.length?"":'<div class="empty">No other registered machines found.</div>';for(const node of nodes){const item=document.createElement("button");item.type="button";item.className=`node${node.node_id===cfg.remote_id?" selected":""}`;const details=(node.ips??[]).join(", ")||"No IP reported";item.innerHTML=`<span><strong>${escapeHtml(node.node_id)}</strong><small>${escapeHtml(details)} · port ${node.tcp_port??cfg.tcp_port}</small></span><span class="badge">${node.node_id===cfg.remote_id?"Selected":"Select"}</span>`;item.onclick=()=>{cfg.remote_id=node.node_id;cfg.vps_base_url=base;$("remote_id").value=node.node_id;renderConnection();loadNodes();};list.append(item);}setStatus(`Loaded ${nodes.length} available machine${nodes.length===1?"":"s"}`,false,true);}catch(error){list.innerHTML=`<div class="empty">${escapeHtml(error.message)}</div>`;setStatus(error.message,true);}finally{button.disabled=false;}}
     document.querySelectorAll(".tab").forEach(tab=>tab.onclick=()=>{if(document.querySelector(".tab[aria-selected=true]").dataset.panel==="advanced"){try{cfg=JSON.parse($("raw").value);}catch(error){setStatus(error.message,true);return;}render();}document.querySelectorAll(".tab").forEach(item=>item.setAttribute("aria-selected",item===tab));document.querySelectorAll(".panel").forEach(panel=>panel.classList.toggle("active",panel.id===tab.dataset.panel));});

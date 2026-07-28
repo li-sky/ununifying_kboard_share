@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 #[command(about = "Share one keyboard and mouse between kbshare peers")]
@@ -107,7 +107,7 @@ struct SessionCtx {
 }
 type SessionSlot = Arc<Mutex<Option<SessionCtx>>>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalMouseInfo {
     fingerprint: Option<Vec<u8>>,
     current_host: u8,
@@ -528,18 +528,21 @@ fn run_session(
     let _ = inbound.on_session_established();
     apply_host_effects(&hello, forwarding, mode_flag);
     send_host_step(&stream, &hello)?;
-    let local_mouse = inspect_local_mouse(&cfg.local_id);
+    let mut local_mouse = inspect_local_mouse(&cfg.local_id);
     if let Some(info) = &local_mouse {
-        send_one(
-            &stream,
-            &Message::MouseInfo {
-                id: cfg.local_id.clone(),
-                fingerprint: info.fingerprint.clone(),
-                current_host: info.current_host,
-                slot: info.slot,
-            },
-        )?;
+        cache_local_mouse_observation(flow, config_path, info)?;
+    } else {
+        local_mouse = cached_local_mouse(&flow.lock());
+        if local_mouse.is_some() {
+            tracing::info!("using cached local mouse fingerprint while the device is offline");
+        }
     }
+    if let Some(info) = &local_mouse {
+        send_mouse_info(&stream, &cfg.local_id, info)?;
+    }
+    let mut last_sent_mouse = local_mouse.clone();
+    let mut remote_mouse: Option<(Option<Vec<u8>>, u8)> = None;
+    let mut last_mouse_inspect = Instant::now();
     send_one(
         &stream,
         &Message::FlowLayout {
@@ -569,6 +572,33 @@ fn run_session(
             }
         };
         let Some(message) = incoming else {
+            if verified
+                && !flow.lock().enabled
+                && last_mouse_inspect.elapsed() >= Duration::from_secs(5)
+            {
+                last_mouse_inspect = Instant::now();
+                if let Some(discovered) = inspect_local_mouse(&cfg.local_id) {
+                    cache_local_mouse_observation(flow, config_path, &discovered)?;
+                    if last_sent_mouse.as_ref() != Some(&discovered) {
+                        send_mouse_info(&stream, &cfg.local_id, &discovered)?;
+                        last_sent_mouse = Some(discovered.clone());
+                    }
+                    local_mouse = Some(discovered);
+                    if let (Some(local), Some((remote_fingerprint, remote_host))) =
+                        (&local_mouse, &remote_mouse)
+                    {
+                        apply_mouse_match(
+                            cfg,
+                            local,
+                            remote_fingerprint.as_deref(),
+                            *remote_host,
+                            flow,
+                            config_path,
+                            &stream,
+                        )?;
+                    }
+                }
+            }
             continue;
         };
         if !verified {
@@ -610,35 +640,17 @@ fn run_session(
             if id != &cfg.remote_id {
                 continue;
             }
+            remote_mouse = Some((fingerprint.clone(), *current_host));
             if let Some(local) = &local_mouse {
-                let updated_flow = {
-                    let mut flow_config = flow.lock();
-                    auto_configure_flow_lite(
-                        &mut flow_config,
-                        &cfg.local_id,
-                        &cfg.remote_id,
-                        local,
-                        fingerprint.as_deref(),
-                        *current_host,
-                    )
-                    .then(|| flow_config.clone())
-                };
-                if let Some(updated_flow) = updated_flow {
-                    kbshare_flow::persist_flow_lite(config_path, &updated_flow)?;
-                    send_one(
-                        &stream,
-                        &Message::FlowLayout {
-                            id: cfg.local_id.clone(),
-                            layout: updated_flow.layout,
-                        },
-                    )?;
-                    tracing::info!(
-                        peer = %cfg.remote_id,
-                        local_host = local.current_host,
-                        remote_host = *current_host,
-                        "matching mouse fingerprint detected; Flow-lite configured"
-                    );
-                }
+                apply_mouse_match(
+                    cfg,
+                    local,
+                    fingerprint.as_deref(),
+                    *current_host,
+                    flow,
+                    config_path,
+                    &stream,
+                )?;
             }
             continue;
         }
@@ -749,11 +761,22 @@ fn report_local_node(cfg: &Config) {
 fn inspect_local_mouse(local_id: &str) -> Option<LocalMouseInfo> {
     match kbshare_flow::inspect_with_fingerprint() {
         Ok(devices) => {
-            let device = devices.into_iter().find(|device| device.is_mouse())?;
+            let Some(device) = devices.into_iter().find(|device| device.is_mouse()) else {
+                tracing::warn!(id = %local_id, "no compatible Logitech mouse found during Flow-lite inspection");
+                return None;
+            };
             let slot = matches!(device.connection, kbshare_flow::ConnectionType::Receiver)
                 .then_some(device.slot);
             if device.fingerprint.is_none() {
                 tracing::warn!(id = %local_id, "mouse detected without feature 0x0003 fingerprint");
+            } else {
+                tracing::info!(
+                    id = %local_id,
+                    fingerprint = %hex_bytes(device.fingerprint.as_ref().expect("checked above")),
+                    current_host = device.current_host,
+                    ?slot,
+                    "Flow-lite mouse inspected"
+                );
             }
             Some(LocalMouseInfo {
                 fingerprint: device.fingerprint.map(Vec::from),
@@ -766,6 +789,101 @@ fn inspect_local_mouse(local_id: &str) -> Option<LocalMouseInfo> {
             None
         }
     }
+}
+
+fn cached_local_mouse(flow: &kbshare_flow::FlowLiteConfig) -> Option<LocalMouseInfo> {
+    Some(LocalMouseInfo {
+        fingerprint: Some(flow.fingerprint?.to_vec()),
+        current_host: flow.local_host,
+        slot: flow.slot,
+    })
+}
+
+fn cache_local_mouse_observation(
+    flow: &Arc<Mutex<kbshare_flow::FlowLiteConfig>>,
+    config_path: &Path,
+    info: &LocalMouseInfo,
+) -> Result<()> {
+    let Some(fingerprint) = info
+        .fingerprint
+        .as_deref()
+        .and_then(|value| <[u8; 16]>::try_from(value).ok())
+    else {
+        return Ok(());
+    };
+    let updated = {
+        let mut config = flow.lock();
+        let changed = config.fingerprint != Some(fingerprint)
+            || config.local_host != info.current_host
+            || config.slot != info.slot;
+        config.fingerprint = Some(fingerprint);
+        config.local_host = info.current_host;
+        config.slot = info.slot;
+        changed.then(|| config.clone())
+    };
+    if let Some(config) = updated {
+        kbshare_flow::persist_flow_lite(config_path, &config)?;
+    }
+    Ok(())
+}
+
+fn send_mouse_info(stream: &SharedStream, local_id: &str, info: &LocalMouseInfo) -> Result<()> {
+    send_one(
+        stream,
+        &Message::MouseInfo {
+            id: local_id.to_string(),
+            fingerprint: info.fingerprint.clone(),
+            current_host: info.current_host,
+            slot: info.slot,
+        },
+    )
+}
+
+fn apply_mouse_match(
+    cfg: &Config,
+    local: &LocalMouseInfo,
+    remote_fingerprint: Option<&[u8]>,
+    remote_host: u8,
+    flow: &Arc<Mutex<kbshare_flow::FlowLiteConfig>>,
+    config_path: &Path,
+    stream: &SharedStream,
+) -> Result<()> {
+    let updated_flow = {
+        let mut flow_config = flow.lock();
+        auto_configure_flow_lite(
+            &mut flow_config,
+            &cfg.local_id,
+            &cfg.remote_id,
+            local,
+            remote_fingerprint,
+            remote_host,
+        )
+        .then(|| flow_config.clone())
+    };
+    if let Some(updated_flow) = updated_flow {
+        kbshare_flow::persist_flow_lite(config_path, &updated_flow)?;
+        send_one(
+            stream,
+            &Message::FlowLayout {
+                id: cfg.local_id.clone(),
+                layout: updated_flow.layout,
+            },
+        )?;
+        tracing::info!(
+            peer = %cfg.remote_id,
+            local_host = local.current_host,
+            remote_host,
+            "matching mouse fingerprint detected; Flow-lite configured"
+        );
+    }
+    Ok(())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 fn auto_configure_flow_lite(
@@ -785,7 +903,12 @@ fn auto_configure_flow_lite(
         || remote_fingerprint.len() != 16
         || local_fingerprint != remote_fingerprint
     {
-        tracing::info!(peer = %remote_id, "mouse fingerprints do not match; Flow-lite remains unchanged");
+        tracing::warn!(
+            peer = %remote_id,
+            local_fingerprint = %hex_bytes(local_fingerprint),
+            remote_fingerprint = %hex_bytes(remote_fingerprint),
+            "mouse fingerprints do not match; Flow-lite remains disabled"
+        );
         return false;
     }
 

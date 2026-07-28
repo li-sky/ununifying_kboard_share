@@ -36,6 +36,7 @@ struct HookState {
 }
 
 static HOOK_STATE: OnceCell<HookState> = OnceCell::new();
+const KBSHARE_INJECTED_MARKER: usize = 0x4b42_5348;
 
 unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     if n_code < 0 {
@@ -43,6 +44,13 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
     }
     if let Some(state) = HOOK_STATE.get() {
         let info = &*(l_param as *const KBDLLHOOKSTRUCT);
+        // SendInput-generated events are the final output of the remote
+        // injection path. Publishing or swallowing them here feeds them back
+        // into kbshare and can prevent toggle keys such as NumLock from ever
+        // reaching Windows.
+        if (info.flags & LLKHF_INJECTED) != 0 && info.dwExtraInfo == KBSHARE_INJECTED_MARKER {
+            return CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param);
+        }
         let vk = info.vkCode;
         let is_down = w_param as u32 == WM_KEYDOWN || w_param as u32 == WM_SYSKEYDOWN;
         let action = if is_down {
@@ -54,11 +62,7 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
         // LLKHF_EXTENDED flag set, identical to how the injector must send
         // it. Promote it to KEY_KPENTER so the peer reproduces the right
         // physical key instead of the main Enter key.
-        let key = if vk == 0x0D && (info.flags & LLKHF_EXTENDED) != 0 {
-            Some(Key::new(kbshare_core::keycode::codes::KEY_KPENTER))
-        } else {
-            from_win_vk(vk)
-        };
+        let key = key_from_hook(vk, info.flags);
         if let Some(key) = key {
             // Best-effort: non-blocking send. If the consumer is slow we'd
             // rather drop than stall the OS hook thread.
@@ -69,6 +73,39 @@ unsafe extern "system" fn hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARA
         }
     }
     CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param)
+}
+
+fn key_from_hook(vk: u32, flags: KBDLLHOOKSTRUCT_FLAGS) -> Option<Key> {
+    use kbshare_core::keycode::codes;
+
+    let extended = (flags & LLKHF_EXTENDED) != 0;
+    if vk == 0x0D && extended {
+        return Some(Key::new(codes::KEY_KPENTER));
+    }
+
+    // With NumLock off Windows reports keypad digits as navigation virtual
+    // keys. The physical keypad variants lack LLKHF_EXTENDED, while the
+    // dedicated navigation cluster carries it.
+    if !extended {
+        let keypad = match vk {
+            0x2D => Some(codes::KEY_KP0),   // INSERT
+            0x23 => Some(codes::KEY_KP1),   // END
+            0x28 => Some(codes::KEY_KP2),   // DOWN
+            0x22 => Some(codes::KEY_KP3),   // NEXT
+            0x25 => Some(codes::KEY_KP4),   // LEFT
+            0x0C => Some(codes::KEY_KP5),   // CLEAR
+            0x27 => Some(codes::KEY_KP6),   // RIGHT
+            0x24 => Some(codes::KEY_KP7),   // HOME
+            0x26 => Some(codes::KEY_KP8),   // UP
+            0x21 => Some(codes::KEY_KP9),   // PRIOR
+            0x2E => Some(codes::KEY_KPDOT), // DELETE
+            _ => None,
+        };
+        if let Some(code) = keypad {
+            return Some(Key::new(code));
+        }
+    }
+    from_win_vk(vk)
 }
 
 // ---- capture ----
@@ -279,7 +316,7 @@ impl WinKeyInjector {
                         wScan: scan as u16,
                         dwFlags: flags,
                         time: 0,
-                        dwExtraInfo: 0,
+                        dwExtraInfo: KBSHARE_INJECTED_MARKER,
                     },
                 },
             };
@@ -338,4 +375,43 @@ fn is_extended_vk(vk: u32) -> bool {
 fn is_extended_key(key: Key) -> bool {
     use kbshare_core::keycode::codes;
     matches!(key.code(), codes::KEY_KPENTER)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kbshare_core::keycode::codes;
+
+    #[test]
+    fn non_extended_navigation_keys_are_physical_keypad_keys() {
+        assert_eq!(key_from_hook(0x2D, 0), Some(Key::new(codes::KEY_KP0)));
+        assert_eq!(key_from_hook(0x23, 0), Some(Key::new(codes::KEY_KP1)));
+        assert_eq!(key_from_hook(0x0C, 0), Some(Key::new(codes::KEY_KP5)));
+        assert_eq!(key_from_hook(0x21, 0), Some(Key::new(codes::KEY_KP9)));
+        assert_eq!(key_from_hook(0x2E, 0), Some(Key::new(codes::KEY_KPDOT)));
+    }
+
+    #[test]
+    fn extended_navigation_keys_remain_navigation_keys() {
+        assert_eq!(
+            key_from_hook(0x2D, LLKHF_EXTENDED),
+            Some(Key::new(codes::KEY_INSERT))
+        );
+        assert_eq!(
+            key_from_hook(0x23, LLKHF_EXTENDED),
+            Some(Key::new(codes::KEY_END))
+        );
+    }
+
+    #[test]
+    fn numlock_and_keypad_enter_keep_their_physical_identity() {
+        assert_eq!(
+            key_from_hook(0x90, LLKHF_EXTENDED),
+            Some(Key::new(codes::KEY_NUMLOCK))
+        );
+        assert_eq!(
+            key_from_hook(0x0D, LLKHF_EXTENDED),
+            Some(Key::new(codes::KEY_KPENTER))
+        );
+    }
 }
