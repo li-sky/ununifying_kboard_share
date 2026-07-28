@@ -240,10 +240,22 @@ mod platform {
     use super::*;
     use anyhow::{anyhow, Context};
     use hidapi::{HidApi, HidDevice};
+    use std::sync::{Mutex as StdMutex, OnceLock};
     use std::time::{Duration, Instant};
 
     const HIDPP_USAGE_PAGES: [u16; 3] = [0xff00, 0xff43, 0xff0c];
     const HIDPP_LONG_USAGES: [u16; 2] = [0x0002, 0x0202];
+    static SWITCH_CACHE: OnceLock<StdMutex<Option<FlowDevice>>> = OnceLock::new();
+
+    fn switch_cache() -> &'static StdMutex<Option<FlowDevice>> {
+        SWITCH_CACHE.get_or_init(|| StdMutex::new(None))
+    }
+
+    fn remember_switch_device(device: &FlowDevice) {
+        if let Ok(mut cache) = switch_cache().lock() {
+            *cache = Some(device.clone());
+        }
+    }
 
     fn is_receiver(product_id: u16) -> bool {
         product_id == BOLT_RECEIVER_PID || UNIFYING_RECEIVER_PIDS.contains(&product_id)
@@ -460,12 +472,19 @@ mod platform {
     pub fn inspect_with_fingerprint() -> Result<Vec<FlowDevice>> {
         let devices = inspect_matching(None)?;
         if !devices.is_empty() {
+            if let Some(mouse) = devices.iter().find(|device| device.is_mouse()) {
+                remember_switch_device(mouse);
+            }
             return Ok(devices);
         }
         // The first query can also wake a sleeping mouse. Retry the complete
         // scan once so transient HID++ timeouts do not disable auto-setup.
         std::thread::sleep(Duration::from_millis(150));
-        inspect_matching(None)
+        let devices = inspect_matching(None)?;
+        if let Some(mouse) = devices.iter().find(|device| device.is_mouse()) {
+            remember_switch_device(mouse);
+        }
+        Ok(devices)
     }
 
     pub fn collections() -> Result<Vec<HidCollection>> {
@@ -485,6 +504,33 @@ mod platform {
     }
 
     pub fn switch_host(slot: Option<u8>, target_host: u8) -> Result<FlowDevice> {
+        let cached = switch_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.clone())
+            .filter(|device| slot.is_none() || slot == Some(device.slot));
+        if let Some(selected) = cached {
+            if target_host < selected.host_count {
+                let api = HidApi::new().context("initialize hidapi")?;
+                if let Ok(path) = std::ffi::CString::new(selected.path.clone()) {
+                    if let Ok(device) = api.open_path(&path) {
+                        if write_only(
+                            &device,
+                            selected.slot,
+                            ((selected.feature_index as u16) << 8) | 0x10,
+                            &[target_host],
+                        )
+                        .is_ok()
+                        {
+                            return Ok(selected);
+                        }
+                    }
+                }
+            }
+            if let Ok(mut cache) = switch_cache().lock() {
+                *cache = None;
+            }
+        }
         let candidates = inspect_matching(slot)?;
         let selected = candidates
             .iter()
@@ -508,6 +554,7 @@ mod platform {
             ((selected.feature_index as u16) << 8) | 0x10,
             &[target_host],
         )?;
+        remember_switch_device(selected);
         Ok(selected.clone())
     }
 

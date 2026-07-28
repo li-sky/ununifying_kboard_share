@@ -41,6 +41,8 @@ pub trait KeyCapture: Send {
 pub struct MouseActivity {
     pub x: Option<i32>,
     pub y: Option<i32>,
+    pub dx: Option<i32>,
+    pub dy: Option<i32>,
     pub desktop_left: Option<i32>,
     pub desktop_right: Option<i32>,
     pub desktop_top: Option<i32>,
@@ -51,6 +53,8 @@ impl MouseActivity {
     pub const UNKNOWN: Self = Self {
         x: None,
         y: None,
+        dx: None,
+        dy: None,
         desktop_left: None,
         desktop_right: None,
         desktop_top: None,
@@ -71,6 +75,22 @@ impl MouseActivity {
 
     pub fn at_bottom_edge(self, threshold_px: i32) -> bool {
         matches!((self.y, self.desktop_bottom), (Some(y), Some(bottom)) if y >= bottom - 1 - threshold_px)
+    }
+
+    pub fn moving_left(self) -> bool {
+        self.dx.is_some_and(|delta| delta < 0)
+    }
+
+    pub fn moving_right(self) -> bool {
+        self.dx.is_some_and(|delta| delta > 0)
+    }
+
+    pub fn moving_up(self) -> bool {
+        self.dy.is_some_and(|delta| delta < 0)
+    }
+
+    pub fn moving_down(self) -> bool {
+        self.dy.is_some_and(|delta| delta > 0)
     }
 }
 
@@ -142,6 +162,8 @@ mod tests {
         let activity = MouseActivity {
             x: Some(1917),
             y: Some(500),
+            dx: Some(12),
+            dy: Some(0),
             desktop_left: Some(-1920),
             desktop_right: Some(1920),
             desktop_top: Some(0),

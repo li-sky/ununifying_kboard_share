@@ -256,10 +256,14 @@ impl MouseWatcher for WinMouseWatcher {
             while !shutdown.load(Ordering::Relaxed) {
                 let mut now = POINT { x: 0, y: 0 };
                 if GetCursorPos(&mut now) != 0 && (now.x != last.x || now.y != last.y) {
+                    let dx = now.x - last.x;
+                    let dy = now.y - last.y;
                     last = now;
                     on_activity(MouseActivity {
                         x: Some(now.x),
                         y: Some(now.y),
+                        dx: Some(dx),
+                        dy: Some(dy),
                         desktop_left: Some(desktop_left),
                         desktop_right: Some(desktop_right),
                         desktop_top: Some(desktop_top),

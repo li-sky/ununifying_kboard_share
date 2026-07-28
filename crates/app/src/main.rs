@@ -1034,10 +1034,14 @@ fn activity_hits_edge(
     threshold: i32,
 ) -> bool {
     match edge {
-        kbshare_flow::FlowEdge::Left => activity.at_left_edge(threshold),
-        kbshare_flow::FlowEdge::Right => activity.at_right_edge(threshold),
-        kbshare_flow::FlowEdge::Top => activity.at_top_edge(threshold),
-        kbshare_flow::FlowEdge::Bottom => activity.at_bottom_edge(threshold),
+        kbshare_flow::FlowEdge::Left => activity.at_left_edge(threshold) && activity.moving_left(),
+        kbshare_flow::FlowEdge::Right => {
+            activity.at_right_edge(threshold) && activity.moving_right()
+        }
+        kbshare_flow::FlowEdge::Top => activity.at_top_edge(threshold) && activity.moving_up(),
+        kbshare_flow::FlowEdge::Bottom => {
+            activity.at_bottom_edge(threshold) && activity.moving_down()
+        }
     }
 }
 
@@ -1227,5 +1231,44 @@ mod tests {
         assert_eq!(gamma.host_index, 1);
         assert_eq!(gamma.x, 500);
         assert!(flow.layout.devices.iter().any(|device| device.id == "beta"));
+    }
+
+    #[test]
+    fn edge_switch_requires_outward_mouse_momentum() {
+        let right_edge = MouseActivity {
+            x: Some(1919),
+            y: Some(540),
+            dx: Some(8),
+            dy: Some(0),
+            desktop_left: Some(0),
+            desktop_right: Some(1920),
+            desktop_top: Some(0),
+            desktop_bottom: Some(1080),
+        };
+        assert!(activity_hits_edge(
+            right_edge,
+            kbshare_flow::FlowEdge::Right,
+            1
+        ));
+
+        let arriving_from_right = MouseActivity {
+            dx: Some(-8),
+            ..right_edge
+        };
+        assert!(!activity_hits_edge(
+            arriving_from_right,
+            kbshare_flow::FlowEdge::Right,
+            1
+        ));
+
+        let stationary_at_edge = MouseActivity {
+            dx: Some(0),
+            ..right_edge
+        };
+        assert!(!activity_hits_edge(
+            stationary_at_edge,
+            kbshare_flow::FlowEdge::Right,
+            1
+        ));
     }
 }
