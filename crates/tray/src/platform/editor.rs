@@ -17,6 +17,23 @@ pub fn launch(
     app_name: String,
     session_active: Arc<AtomicBool>,
 ) -> Result<Receiver<EditorEvent>> {
+    launch_with_fragment(config_path, app_name, session_active, None)
+}
+
+pub fn launch_import(
+    config_path: PathBuf,
+    app_name: String,
+    session_active: Arc<AtomicBool>,
+) -> Result<Receiver<EditorEvent>> {
+    launch_with_fragment(config_path, app_name, session_active, Some("import"))
+}
+
+fn launch_with_fragment(
+    config_path: PathBuf,
+    app_name: String,
+    session_active: Arc<AtomicBool>,
+    fragment: Option<&str>,
+) -> Result<Receiver<EditorEvent>> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind local editor")?;
     let address = listener.local_addr()?;
     let token = format!(
@@ -28,7 +45,10 @@ pub fn launch(
             .as_nanos()
     );
     let route = format!("/{token}");
-    let url = format!("http://{address}{route}");
+    let fragment = fragment
+        .map(|fragment| format!("#{fragment}"))
+        .unwrap_or_default();
+    let url = format!("http://{address}{route}{fragment}");
     let (sender, receiver) = mpsc::channel();
 
     std::thread::Builder::new()
@@ -46,9 +66,11 @@ pub fn launch(
             }
         })?;
     tracing::info!(%url, "configuration editor opened");
-    #[cfg(debug_assertions)]
     eprintln!("configuration editor: {url}");
-    open::that_detached(&url).with_context(|| format!("open {url}"))?;
+    if let Err(error) = open::that_detached(&url) {
+        tracing::warn!(%url, error = %error, "could not open the default browser");
+        eprintln!("could not open the default browser; open the URL above manually: {error}");
+    }
     Ok(receiver)
 }
 
@@ -136,6 +158,17 @@ fn serve(
                         )?;
                     }
                 }
+            }
+            Ok(request)
+                if request.method == "POST" && request.path == format!("{route}/install-udev") =>
+            {
+                let result = kbshare_flow::install_udev_rule_with_polkit().map(|()| {
+                    serde_json::json!({
+                        "ok": true,
+                        "message": "Logitech HID access was installed"
+                    })
+                });
+                respond_json_result(&mut stream, result)?;
             }
             Ok(request)
                 if request.method == "POST" && request.path == format!("{route}/certificate") =>
@@ -442,6 +475,15 @@ fn render_page(config: &Value, app_name: &str, route: &str) -> Result<String> {
         .replace("__ROLE__", role)
         .replace("__SAVE_ROUTE__", &format!("{route}/save"))
         .replace("__INSPECT_ROUTE__", &format!("{route}/inspect"))
+        .replace("__INSTALL_UDEV_ROUTE__", &format!("{route}/install-udev"))
+        .replace(
+            "__IS_LINUX__",
+            if cfg!(target_os = "linux") {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .replace("__CERTIFICATE_ROUTE__", &format!("{route}/certificate"))
         .replace("__REGISTER_ROUTE__", &format!("{route}/register"))
         .replace("__NODES_ROUTE__", &format!("{route}/nodes"))
@@ -788,10 +830,10 @@ const PAGE_V2: &str = r#"<!doctype html>
         <div class="datum wide"><span>Feature 0x0003 fingerprint</span><strong id="flow_fingerprint">—</strong></div>
       </div>
       <h3>Screen layout</h3><p class="copy">Drag each screen to match its physical position. Channel, receiver slot, and fingerprint remain automatic.</p><div class="layout-canvas" id="layout_canvas"></div>
-      <div class="row" style="margin-top:20px"><button class="secondary" id="inspect_mouse" type="button">Inspect this machine now</button><span id="inspect_result" class="copy" style="margin:0"></span></div>
+      <div class="row" style="margin-top:20px"><button class="secondary" id="inspect_mouse" type="button">Inspect this machine now</button><button class="secondary" id="install_hid_access" type="button" hidden>Install Linux HID access…</button><span id="inspect_result" class="copy" style="margin:0"></span></div>
     </section>
     <section class="panel" id="advanced"><h2>Advanced configuration</h2><p class="copy">Unknown fields are preserved. Flow-Lite identity fields should normally be left to automatic detection.</p><textarea id="raw" spellcheck="false"></textarea></section>
-    <footer><span id="status">Ready</span><button class="save" id="save" type="button">Save and restart</button></footer>
+    <footer><span id="status">Ready</span><input id="config_file" type="file" accept=".json,application/json" hidden><button class="secondary" id="import_config" type="button">Load config file…</button><button class="save" id="save" type="button">Save and restart</button></footer>
   </main>
 
   <div class="wizard" id="wizard" hidden>
@@ -808,10 +850,11 @@ const PAGE_V2: &str = r#"<!doctype html>
   </div>
 
   <script>
-    const saveRoute="__SAVE_ROUTE__", inspectRoute="__INSPECT_ROUTE__", certificateRoute="__CERTIFICATE_ROUTE__", registerRoute="__REGISTER_ROUTE__", nodesRoute="__NODES_ROUTE__", statusRoute="__STATUS_ROUTE__";
+    const saveRoute="__SAVE_ROUTE__", inspectRoute="__INSPECT_ROUTE__", installUdevRoute="__INSTALL_UDEV_ROUTE__", certificateRoute="__CERTIFICATE_ROUTE__", registerRoute="__REGISTER_ROUTE__", nodesRoute="__NODES_ROUTE__", statusRoute="__STATUS_ROUTE__", isLinux=__IS_LINUX__;
     let cfg=__INITIAL_CONFIG__, wizardStep=0, certificateReady=false, connected=false, layoutDirty=false;
     const $=id=>document.getElementById(id);
-    cfg.remote_id??=""; cfg.flow_lite??={}; cfg.tcp_port??=5005; cfg.auto_trust_first_seen??=true;
+    function normalizeConfig(){cfg.remote_id??="";cfg.flow_lite??={};cfg.tcp_port??=5005;cfg.auto_trust_first_seen??=true;}
+    normalizeConfig();
     function setStatus(message,error=false,ok=false){$("status").textContent=message;$("status").className=error?"error":ok?"ok":"";}
     function fingerprint(value){return Array.isArray(value)&&value.length?value.map(byte=>Number(byte).toString(16).padStart(2,"0")).join(""):"—";}
     function renderFlow(){
@@ -831,8 +874,12 @@ const PAGE_V2: &str = r#"<!doctype html>
     async function loadNodes(){const button=$("refresh_nodes"),list=$("node_list"),base=$("registry_url").value.trim();if(!base){setStatus("Enter the registry endpoint first",true);return;}button.disabled=true;list.innerHTML='<div class="empty">Loading registered nodes…</div>';try{const r=await fetch(nodesRoute,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({base_url:base})}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Could not load nodes");const nodes=out.nodes.filter(node=>node.node_id!==cfg.local_id);list.innerHTML=nodes.length?"":'<div class="empty">No other registered machines found.</div>';for(const node of nodes){const item=document.createElement("button");item.type="button";item.className=`node${node.node_id===cfg.remote_id?" selected":""}`;const details=(node.ips??[]).join(", ")||"No IP reported";item.innerHTML=`<span><strong>${escapeHtml(node.node_id)}</strong><small>${escapeHtml(details)} · port ${node.tcp_port??cfg.tcp_port}</small></span><span class="badge">${node.node_id===cfg.remote_id?"Selected":"Select"}</span>`;item.onclick=()=>{cfg.remote_id=node.node_id;cfg.vps_base_url=base;$("remote_id").value=node.node_id;renderConnection();loadNodes();};list.append(item);}setStatus(`Loaded ${nodes.length} available machine${nodes.length===1?"":"s"}`,false,true);}catch(error){list.innerHTML=`<div class="empty">${escapeHtml(error.message)}</div>`;setStatus(error.message,true);}finally{button.disabled=false;}}
     document.querySelectorAll(".tab").forEach(tab=>tab.onclick=()=>{if(document.querySelector(".tab[aria-selected=true]").dataset.panel==="advanced"){try{cfg=JSON.parse($("raw").value);}catch(error){setStatus(error.message,true);return;}render();}document.querySelectorAll(".tab").forEach(item=>item.setAttribute("aria-selected",item===tab));document.querySelectorAll(".panel").forEach(panel=>panel.classList.toggle("active",panel.id===tab.dataset.panel));});
     $("refresh_nodes").onclick=()=>{collect();loadNodes();};
+    $("import_config").onclick=()=>$("config_file").click();
+    $("config_file").onchange=async event=>{const file=event.target.files?.[0];if(!file)return;try{const imported=JSON.parse(await file.text());if(!imported||Array.isArray(imported)||typeof imported!=="object")throw new Error("Configuration root must be a JSON object");cfg=imported;normalizeConfig();layoutDirty=false;render();setStatus(`Loaded ${file.name}. Review it, then save and restart.`,false,true);}catch(error){setStatus(`Could not load config: ${error.message}`,true);}finally{event.target.value="";}};
     $("save").onclick=async()=>{try{const data=document.querySelector(".tab[aria-selected=true]").dataset.panel==="advanced"?JSON.parse($("raw").value):collect();await save(data,$("save"));}catch(error){setStatus(error.message,true);}};
-    $("inspect_mouse").onclick=async()=>{const button=$("inspect_mouse");button.disabled=true;$("inspect_result").textContent="Inspecting…";try{const r=await fetch(inspectRoute),out=await r.json();if(!out.ok)throw new Error(out.error||"Inspection failed");const mouse=out.devices.find(device=>device.is_mouse);if(!mouse)throw new Error("No compatible Logitech mouse found");$("inspect_result").textContent=`${mouse.name}; channel ${Number(mouse.current_host)+1}; slot ${mouse.connection==="receiver"?mouse.slot:"direct"}; fingerprint ${mouse.fingerprint??"unavailable"}`;}catch(error){$("inspect_result").textContent=error.message;}finally{button.disabled=false;}};
+    $("install_hid_access").hidden=!isLinux;
+    $("inspect_mouse").onclick=async()=>{const button=$("inspect_mouse");button.disabled=true;$("inspect_result").textContent="Inspecting…";try{const r=await fetch(inspectRoute),out=await r.json();if(!out.ok)throw new Error(out.error||"Inspection failed");const mouse=out.devices.find(device=>device.is_mouse);if(!mouse)throw new Error("No compatible Logitech mouse found");$("install_hid_access").hidden=true;$("inspect_result").textContent=`${mouse.name}; channel ${Number(mouse.current_host)+1}; slot ${mouse.connection==="receiver"?mouse.slot:"direct"}; fingerprint ${mouse.fingerprint??"unavailable"}`;}catch(error){if(isLinux&&/hidraw|permission denied/i.test(error.message))$("install_hid_access").hidden=false;$("inspect_result").textContent=error.message;}finally{button.disabled=false;}};
+    $("install_hid_access").onclick=async()=>{const button=$("install_hid_access");button.disabled=true;$("inspect_result").textContent="Waiting for system authorization…";try{const r=await fetch(installUdevRoute,{method:"POST"}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Could not install HID access");$("inspect_result").textContent="HID access installed. Rescanning…";await $("inspect_mouse").click();}catch(error){$("inspect_result").textContent=error.message;}finally{button.disabled=false;}};
     function openWizard(){wizardStep=0;certificateReady=false;$("wizard_local_id").value=cfg.local_id??"";$("wizard_cert_file").value=cfg.cert_file??"certs/kbshare_cert.pem";$("wizard_key_file").value=cfg.key_file??"certs/kbshare_key.pem";$("wizard_registry").value=cfg.vps_base_url??"";$("wizard_port").value=cfg.tcp_port??5005;$("certificate_result").className="result";$("certificate_result").textContent="Certificate has not been verified yet.";$("register_result").className="result";$("register_result").textContent="Ready to register this machine.";$("wizard").hidden=false;showStep();}
     function showStep(){document.querySelectorAll(".step").forEach((step,index)=>step.classList.toggle("active",index===wizardStep));document.querySelectorAll(".progress span").forEach((step,index)=>step.classList.toggle("active",index===wizardStep));$("wizard_back").disabled=wizardStep===0;$("wizard_next").textContent=wizardStep===2?"Register this machine":"Next";}
     function validateName(){const local=$("wizard_local_id").value.trim();if(!local)throw new Error("Name this machine before continuing");if(local!==cfg.local_id)certificateReady=false;cfg.local_id=local;}
@@ -841,7 +888,7 @@ const PAGE_V2: &str = r#"<!doctype html>
     $("wizard_exit").onclick=()=>$("wizard").hidden=true;$("open_wizard").onclick=openWizard;
     $("generate_certificate").onclick=async()=>{const button=$("generate_certificate"),result=$("certificate_result");try{validateName();const cert=$("wizard_cert_file").value.trim(),key=$("wizard_key_file").value.trim();if(!cert||!key)throw new Error("Certificate and key paths are required");button.disabled=true;result.className="result";result.textContent="Generating or verifying…";const r=await fetch(certificateRoute,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({local_id:cfg.local_id,cert_file:cert,key_file:key})}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Certificate operation failed");certificateReady=true;cfg.cert_file=cert;cfg.key_file=key;result.className="result ok";result.textContent=`${out.created?"Created":"Verified"} certificate. SHA-256: ${out.fingerprint}`;}catch(error){certificateReady=false;result.className="result error";result.textContent=error.message;}finally{button.disabled=false;}};
     async function registerMachine(){const button=$("wizard_next"),result=$("register_result"),base=$("wizard_registry").value.trim(),port=Number($("wizard_port").value);validateName();if(!certificateReady)throw new Error("Verify the certificate first");if(!base)throw new Error("Enter the registry endpoint");if(!Number.isInteger(port)||port<1||port>65535)throw new Error("Enter a valid TCP port");cfg.remote_id="";cfg.vps_base_url=base;cfg.tcp_port=port;cfg.auto_trust_first_seen=true;cfg.flow_lite={...(cfg.flow_lite??{}),enabled:false,slot:null,fingerprint:null,layout:{version:0,updated_by:"",devices:[]}};button.disabled=true;result.className="result";result.textContent="Reporting this machine…";try{const r=await fetch(registerRoute,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Registration failed");result.className="result ok";result.textContent=`Registered ${out.node_id} at ${out.ips.join(", ")}. Restarting in waiting mode…`;setStatus("Registration complete. Restarting…",false,true);}catch(error){button.disabled=false;result.className="result error";result.textContent=error.message;throw error;}}
-    render();pollStatus();setInterval(pollStatus,3000);if(!cfg.local_id)openWizard();else if(cfg.vps_base_url)loadNodes();
+    render();pollStatus();setInterval(pollStatus,3000);if(location.hash.slice(1)==="import"){setStatus("Choose “Load config file…” to import a JSON configuration.",false,true);$("import_config").focus();}if(!cfg.local_id)openWizard();else if(cfg.vps_base_url)loadNodes();
   </script>
 </body>
 </html>"#;
@@ -862,11 +909,13 @@ mod tests {
         assert!(page.contains("host node"));
         assert!(page.contains("/token/save"));
         assert!(page.contains("/token/inspect"));
+        assert!(page.contains("/token/install-udev"));
         assert!(page.contains("/token/certificate"));
         assert!(page.contains("/token/register"));
         assert!(page.contains("/token/nodes"));
         assert!(page.contains("/token/status"));
         assert!(page.contains("Register this machine"));
+        assert!(page.contains("Load config file"));
     }
 
     #[test]

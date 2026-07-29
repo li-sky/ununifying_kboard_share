@@ -1,11 +1,13 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-#[cfg(windows)]
 fn main() -> anyhow::Result<()> {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
+    if kbshare_flow::run_udev_helper_if_requested()? {
+        return Ok(());
+    }
     let mut args = std::env::args_os().skip(1);
     let config = PathBuf::from(
         args.next()
@@ -22,9 +24,4 @@ fn main() -> anyhow::Result<()> {
         kbshare_tray::ConfigEditorEvent::Failed(error) => anyhow::bail!(error),
     }
     Ok(())
-}
-
-#[cfg(not(windows))]
-fn main() {
-    eprintln!("kbshare-config is currently available on Windows");
 }

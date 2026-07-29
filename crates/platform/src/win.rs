@@ -260,6 +260,7 @@ impl MouseWatcher for WinMouseWatcher {
                     let dy = now.y - last.y;
                     last = now;
                     on_activity(MouseActivity {
+                        edge: None,
                         x: Some(now.x),
                         y: Some(now.y),
                         dx: Some(dx),

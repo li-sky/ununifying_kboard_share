@@ -1,0 +1,14 @@
+# Allow the active desktop user to access Logitech HID++ hidraw collections.
+# Install this file in /etc/udev/rules.d/, reload the rules, then replug the
+# receiver (or run: sudo udevadm trigger --subsystem-match=hidraw).
+
+ACTION=="remove", GOTO="kbshare_logitech_end"
+SUBSYSTEM!="hidraw", GOTO="kbshare_logitech_end"
+
+# USB receivers and directly connected Logitech HID++ devices.
+ATTRS{idVendor}=="046d", TAG+="uaccess", GOTO="kbshare_logitech_end"
+
+# Bluetooth HID devices use an uppercase HID bus identifier in sysfs.
+KERNELS=="0005:046D:*", TAG+="uaccess"
+
+LABEL="kbshare_logitech_end"

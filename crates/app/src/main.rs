@@ -13,7 +13,10 @@ use kbshare_net::registry::{NodeReport, RegistryClient};
 use kbshare_net::session::{client_handshake, recv_message, server_handshake};
 use kbshare_net::tls::{build_client_config, build_server_config};
 use kbshare_net::trust::{AutoTrustPolicy, TrustDecision, TrustStore};
-use kbshare_platform::{default_capture, default_injector, default_mouse_watcher, MouseActivity};
+use kbshare_platform::{
+    default_capture_with_shutdown, default_injector_with_shutdown, default_mouse_watcher,
+    MouseActivity,
+};
 use kbshare_tray::{TrayConfig, TrayExit, MODE_LOCAL, MODE_REMOTE};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -115,6 +118,9 @@ struct LocalMouseInfo {
 }
 
 fn main() -> Result<()> {
+    if kbshare_flow::run_udev_helper_if_requested()? {
+        return Ok(());
+    }
     let args = Args::parse();
     let paths = resolve_runtime_paths(&args.config)?;
     let _log_guard = init_logging(&paths.log_file)?;
@@ -134,35 +140,24 @@ fn run(paths: RuntimePaths) -> Result<()> {
     // the setup wizard; saving restarts the app with a complete config.
     if cfg.local_id.trim().is_empty() {
         tracing::info!("first-run detected; launching configuration editor");
-        #[cfg(windows)]
-        {
-            let session_active = Arc::new(AtomicBool::new(false));
-            let events = kbshare_tray::launch_config_editor(
-                paths.config_path.clone(),
-                "kbshare".to_string(),
-                session_active,
-            )?;
-            match events.recv() {
-                Ok(kbshare_tray::ConfigEditorEvent::Saved(path)) => {
-                    tracing::info!(path = %path.display(), "configuration saved; restarting");
-                    relaunch_with_config(&path)?;
-                    return Ok(());
-                }
-                Ok(kbshare_tray::ConfigEditorEvent::Failed(error)) => {
-                    return Err(anyhow!("configuration editor failed: {error}"));
-                }
-                Err(error) => {
-                    return Err(anyhow!("configuration editor closed unexpectedly: {error}"));
-                }
+        let session_active = Arc::new(AtomicBool::new(false));
+        let events = kbshare_tray::launch_config_editor(
+            paths.config_path.clone(),
+            "kbshare".to_string(),
+            session_active,
+        )?;
+        match events.recv() {
+            Ok(kbshare_tray::ConfigEditorEvent::Saved(path)) => {
+                tracing::info!(path = %path.display(), "configuration saved; restarting");
+                relaunch_with_config(&path)?;
+                return Ok(());
             }
-        }
-        #[cfg(not(windows))]
-        {
-            return Err(anyhow!(
-                "configuration at {} is empty; the interactive setup wizard is only available on Windows. \
-                 Fill in local_id, remote_id and other fields manually.",
-                paths.config_path.display()
-            ));
+            Ok(kbshare_tray::ConfigEditorEvent::Failed(error)) => {
+                return Err(anyhow!("configuration editor failed: {error}"));
+            }
+            Err(error) => {
+                return Err(anyhow!("configuration editor closed unexpectedly: {error}"));
+            }
         }
     }
 
@@ -261,10 +256,12 @@ fn run_engine(
     };
     let flow = Arc::new(Mutex::new(cfg.flow_lite.clone()));
     let slot: SessionSlot = Arc::new(Mutex::new(None));
-    let injector: SharedInjector = Arc::new(Mutex::new(default_injector()?));
+    let injector: SharedInjector = Arc::new(Mutex::new(default_injector_with_shutdown(
+        shutdown.clone(),
+    )?));
     let mouse_tick = Arc::new(AtomicBool::new(false));
 
-    let mut capture = default_capture()?;
+    let mut capture = default_capture_with_shutdown(shutdown.clone())?;
     let forwarding = capture.forwarding_flag();
     {
         let slot = slot.clone();
@@ -296,7 +293,7 @@ fn run_engine(
             };
             let flow_config = flow.lock().clone();
             let target = flow_config.target_for_peer(&local_id, &remote_id);
-            if flow_config.enabled
+            if edge_departure_enabled(flow_config.enabled, activity)
                 && ctx.outbound.mode() == Mode::Local
                 && target
                     .map(|target| {
@@ -305,8 +302,17 @@ fn run_engine(
                     .unwrap_or(false)
             {
                 let target = target.expect("edge target checked");
-                match kbshare_flow::switch_host(flow_config.slot, target.host_index) {
-                    Ok(_) => {
+                let switched = if flow_config.enabled {
+                    kbshare_flow::switch_host(flow_config.slot, target.host_index).map(|_| ())
+                } else {
+                    tracing::info!(
+                        edge = ?activity.edge,
+                        "Wayland pointer barrier activated keyboard-only remote mode"
+                    );
+                    Ok(())
+                };
+                match switched {
+                    Ok(()) => {
                         mouse_tick.store(false, Ordering::Relaxed);
                         let step = ctx.outbound.on_flow_departure();
                         apply_host_effects(&step, &forwarding, &mode_flag);
@@ -987,6 +993,13 @@ fn send_one(stream: &SharedStream, message: &Message) -> Result<()> {
 
 fn send_host_step(stream: &SharedStream, step: &Step) -> Result<()> {
     for message in &step.outgoing {
+        if let Message::Key { action, code } = message {
+            tracing::info!(
+                ?action,
+                keycode = code.code(),
+                "sending forwarded key to peer"
+            );
+        }
         send_one(stream, message)?;
     }
     Ok(())
@@ -1001,6 +1014,11 @@ fn apply_client_step(
         send_one(stream, message)?;
     }
     for (action, key) in &step.inject {
+        tracing::info!(
+            ?action,
+            keycode = key.code(),
+            "received forwarded key; injecting locally"
+        );
         let mut injector = injector.lock();
         match action {
             kbshare_core::protocol::KeyAction::Press => injector.press(*key)?,
@@ -1013,8 +1031,14 @@ fn apply_client_step(
 fn apply_host_effects(step: &Step, forwarding: &Arc<AtomicBool>, mode_flag: &Arc<AtomicU8>) {
     for effect in &step.effects {
         match effect {
-            SideEffect::StartForwardingKeyboard => forwarding.store(true, Ordering::Relaxed),
-            SideEffect::ResumeLocalKeyboard => forwarding.store(false, Ordering::Relaxed),
+            SideEffect::StartForwardingKeyboard => {
+                forwarding.store(true, Ordering::Relaxed);
+                tracing::info!("keyboard forwarding enabled");
+            }
+            SideEffect::ResumeLocalKeyboard => {
+                forwarding.store(false, Ordering::Relaxed);
+                tracing::info!("keyboard forwarding disabled; local keyboard resumed");
+            }
             SideEffect::Notify(mode) => mode_flag.store(
                 if *mode == Mode::Remote {
                     MODE_REMOTE
@@ -1033,6 +1057,24 @@ fn activity_hits_edge(
     edge: kbshare_flow::FlowEdge,
     threshold: i32,
 ) -> bool {
+    if let Some(portal_edge) = activity.edge {
+        return matches!(
+            (portal_edge, edge),
+            (
+                kbshare_platform::MouseEdge::Left,
+                kbshare_flow::FlowEdge::Left
+            ) | (
+                kbshare_platform::MouseEdge::Right,
+                kbshare_flow::FlowEdge::Right
+            ) | (
+                kbshare_platform::MouseEdge::Top,
+                kbshare_flow::FlowEdge::Top
+            ) | (
+                kbshare_platform::MouseEdge::Bottom,
+                kbshare_flow::FlowEdge::Bottom
+            )
+        );
+    }
     match edge {
         kbshare_flow::FlowEdge::Left => activity.at_left_edge(threshold) && activity.moving_left(),
         kbshare_flow::FlowEdge::Right => {
@@ -1043,6 +1085,10 @@ fn activity_hits_edge(
             activity.at_bottom_edge(threshold) && activity.moving_down()
         }
     }
+}
+
+fn edge_departure_enabled(flow_lite_enabled: bool, activity: MouseActivity) -> bool {
+    flow_lite_enabled || activity.edge.is_some()
 }
 
 fn sleep_or_stop(total: Duration, shutdown: &AtomicBool) {
@@ -1236,6 +1282,7 @@ mod tests {
     #[test]
     fn edge_switch_requires_outward_mouse_momentum() {
         let right_edge = MouseActivity {
+            edge: None,
             x: Some(1919),
             y: Some(540),
             dx: Some(8),
@@ -1270,5 +1317,22 @@ mod tests {
             kbshare_flow::FlowEdge::Right,
             1
         ));
+
+        let wayland_barrier = MouseActivity {
+            edge: Some(kbshare_platform::MouseEdge::Right),
+            ..MouseActivity::UNKNOWN
+        };
+        assert!(activity_hits_edge(
+            wayland_barrier,
+            kbshare_flow::FlowEdge::Right,
+            0
+        ));
+        assert!(!activity_hits_edge(
+            wayland_barrier,
+            kbshare_flow::FlowEdge::Left,
+            0
+        ));
+        assert!(edge_departure_enabled(false, wayland_barrier));
+        assert!(!edge_departure_enabled(false, MouseActivity::UNKNOWN));
     }
 }

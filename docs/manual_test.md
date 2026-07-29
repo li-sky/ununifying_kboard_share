@@ -3,17 +3,21 @@
 纯代码层面的验证由 `cargo test` 覆盖（core 单测 + TLS loopback 集成测试）。
 本文档记录 **需要真人参与的最终检查**，确保：
 
-1. Windows LL hook 真的在拦截物理按键。
+1. Windows LL hook / Linux InputCapture+libei（或 evdev 回退）真的在拦截
+   物理按键。
 2. 远程模式下，本机**不会**收到被吞掉的按键。
-3. 对端 `SendInput` 注入的按键真的落进了目标应用。
+3. 对端 `SendInput` / Linux RemoteDesktop+libei（或 uinput 回退）注入的按键
+   真的落进了目标应用。
 4. 断线 / 鼠标回本机时，没有卡键。
 
 > 这套流程需要两台机器，或一台机器上开两个不同的用户会话。**两个 kbshare
-> 进程绝对不要同时跑在同一个桌面会话**——LL hook 会互相干扰。
+> 进程绝对不要同时跑在同一个桌面会话**——键盘 hook / InputCapture / evdev
+> grab 会互相干扰。
 
 ## 预备
 
-两端都先执行 `cargo build --release`，拿到 `target/release/kbshare.exe`。
+两端都先执行 `cargo build --release`，拿到 Windows 的
+`target/release/kbshare.exe` 或 Linux 的 `target/release/kbshare`。
 
 分别在项目目录下放配置（参考 `examples/config.json`）：
 
@@ -31,7 +35,7 @@
 
 1. 启动两端（顺序无关）：
    ```
-   kbshare.exe --config config.json
+   kbshare --config config.json
    ```
 2. 观察日志中出现：
    - `kbshare peer starting ... fingerprint=...`
@@ -49,6 +53,30 @@
 mode transitioned: Remote
 ```
 
+### Wayland Flow 边缘
+
+Wayland 会话额外检查标准 portal 路径：
+
+1. 确认安装了 `xdg-desktop-portal` 和当前桌面对应的 portal 后端。
+2. 启动后按桌面弹窗允许 kbshare 控制键盘和捕获指针；这是 RemoteDesktop 与
+   InputCapture 两个独立授权会话。
+3. 日志应出现：
+   ```
+   Wayland keyboard injection is active through RemoteDesktop/libei
+   Wayland InputCapture pointer barriers configured
+   Wayland keyboard capture and Flow edge detection are active through InputCapture/libei
+   ```
+4. 将指针向配置中的对端方向越过桌面最外边界，应只触发一次 Easy-Switch；
+   多屏之间的内部接缝不应触发。
+   `flow_lite.enabled=false` 时不会执行 Easy-Switch，但应进入仅键盘远程模式；
+   把指针向本机方向退回后应恢复本机键盘。
+5. 改分辨率、旋转或热插拔显示器后再次测试。程序应收到 `ZonesChanged`，重建
+   barriers 后继续工作。
+
+如果 portal 不支持 InputCapture，日志会打印
+`Wayland keyboard capture unavailable; trying evdev fallback`；边缘检测也会尝试
+X11/XWayland 回退。纯 Wayland 下不能把读取全局坐标作为回退方案。
+
 ## 步骤 3：键盘透传
 
 此时在 **本机** 任意窗口（记事本最合适）按下一些字母、Ctrl+A、方向键。
@@ -58,9 +86,11 @@ mode transitioned: Remote
 - 对端前台窗口（记事本）看到完整输入，顺序和节奏都对。
 
 常见失败信号：
-- 本机窗口也出现了字符 → 说明 LL hook 没生效或 `forwarding_flag` 没被置位。
-- 对端漏字 → 检查是否因为 SendInput extended flag 缺失（参见
-  `is_extended_vk` 覆盖列表）。
+- 本机窗口也出现了字符 → 说明 LL hook / Wayland InputCapture / evdev grab
+  没生效，或 `forwarding_flag` 没被置位。
+- 对端漏字 → Windows 检查 SendInput extended flag（参见 `is_extended_vk`）。
+  Wayland 检查 `RemoteDesktop/libei` 会话是否仍为 active；X11/uinput 回退检查
+  `/dev/uinput` 权限和虚拟键盘是否创建成功。
 - 出现乱序 → NDJSON 解码问题，应该不会发生；若复现请把 RUST_LOG=debug
   打开并抓一份 `[Key ...]` 日志 + 对端的 `inject` 日志。
 

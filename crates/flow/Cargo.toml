@@ -29,3 +29,4 @@ hidapi = { version = "2", default-features = false, features = ["windows-native"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 hidapi = { version = "2", default-features = false, features = ["linux-native-basic-udev"] }
+libc = "0.2"

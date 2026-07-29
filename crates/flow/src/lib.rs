@@ -3,6 +3,8 @@ pub use kbshare_core::protocol::{FlowLayout, FlowLayoutDevice};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub const UDEV_HELPER_ARG: &str = "--kbshare-install-udev-rule-helper";
+
 const LOGITECH_VENDOR_ID: u16 = 0x046d;
 const BOLT_RECEIVER_PID: u16 = 0xc548;
 const UNIFYING_RECEIVER_PIDS: [u16; 2] = [0xc52b, 0xc532];
@@ -10,8 +12,8 @@ const FEATURE_ROOT: u16 = 0x0000;
 const FEATURE_DEVICE_FINGERPRINT: u16 = 0x0003;
 const FEATURE_DEVICE_TYPE_AND_NAME: u16 = 0x0005;
 const FEATURE_CHANGE_HOST: u16 = 0x1814;
+const REPORT_SHORT: u8 = 0x10;
 const REPORT_LONG: u8 = 0x11;
-const SOFTWARE_ID: u8 = 0x08;
 const DIRECT_DEVICE_INDEX: u8 = 0xff;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +191,163 @@ pub fn persist_flow_lite(config_path: &Path, config: &FlowLiteConfig) -> Result<
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+const UDEV_RULE: &[u8] = include_bytes!("../../../packaging/udev/70-kbshare-logitech.rules");
+#[cfg(target_os = "linux")]
+const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/70-kbshare-logitech.rules";
+
+/// Run the fixed privileged helper action when the process was launched by
+/// pkexec. Call this before normal command-line parsing in each UI executable.
+pub fn run_udev_helper_if_requested() -> Result<bool> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new(UDEV_HELPER_ARG)) {
+        return Ok(false);
+    }
+    if args.next().is_some() {
+        bail!("the udev helper does not accept additional arguments");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        install_udev_rule_as_root()?;
+        Ok(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    bail!("the udev helper is only available on Linux")
+}
+
+/// Ask the desktop Polkit authentication agent to authorize the current
+/// executable's fixed udev helper action.
+#[cfg(target_os = "linux")]
+pub fn install_udev_rule_with_polkit() -> Result<()> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    let pkexec = fixed_system_program(&["/usr/bin/pkexec", "/bin/pkexec"], "Polkit pkexec")?;
+    let executable = std::env::current_exe().context("locate the running kbshare executable")?;
+    let output = Command::new(pkexec)
+        .arg(&executable)
+        .arg(UDEV_HELPER_ARG)
+        .output()
+        .context("start Polkit authorization")?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match output.status.code() {
+        Some(126) => bail!("authorization was cancelled"),
+        Some(127) if detail.is_empty() => bail!("authorization was denied"),
+        _ if detail.is_empty() => bail!("privileged udev installation failed"),
+        _ => bail!("privileged udev installation failed: {detail}"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn install_udev_rule_with_polkit() -> Result<()> {
+    bail!("Polkit udev installation is only available on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn install_udev_rule_as_root() -> Result<()> {
+    use anyhow::Context;
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("the udev installation helper must run as root");
+    }
+
+    let target = Path::new(UDEV_RULE_PATH);
+    let udevadm = fixed_system_program(
+        &[
+            "/usr/bin/udevadm",
+            "/bin/udevadm",
+            "/usr/sbin/udevadm",
+            "/sbin/udevadm",
+        ],
+        "udevadm",
+    )?;
+    let rules_dir = target
+        .parent()
+        .expect("the fixed udev rule path has a parent");
+    let already_current = std::fs::symlink_metadata(target)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .and_then(|_| std::fs::read(target).ok())
+        .is_some_and(|current| current == UDEV_RULE);
+
+    if !already_current {
+        std::fs::create_dir_all(rules_dir).context("create /etc/udev/rules.d")?;
+        let temporary =
+            rules_dir.join(format!(".70-kbshare-logitech.{}.rules", std::process::id()));
+        let install_result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .with_context(|| format!("create {}", temporary.display()))?;
+            file.write_all(UDEV_RULE)
+                .context("write bundled udev rule")?;
+            file.sync_all().context("sync bundled udev rule")?;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644))
+                .context("set udev rule permissions")?;
+            run_checked(
+                udevadm,
+                &["verify", temporary.to_string_lossy().as_ref()],
+                "verify bundled udev rule",
+            )?;
+            std::fs::rename(&temporary, target)
+                .with_context(|| format!("install {UDEV_RULE_PATH}"))?;
+            File::open(rules_dir)
+                .and_then(|directory| directory.sync_all())
+                .context("sync udev rules directory")?;
+            Ok(())
+        })();
+        if install_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        install_result?;
+    }
+
+    run_checked(udevadm, &["control", "--reload-rules"], "reload udev rules")?;
+    run_checked(
+        udevadm,
+        &["trigger", "--subsystem-match=hidraw"],
+        "apply udev rules to hidraw devices",
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn fixed_system_program(candidates: &[&'static str], name: &str) -> Result<&'static str> {
+    candidates
+        .iter()
+        .copied()
+        .find(|path| Path::new(path).is_file())
+        .ok_or_else(|| anyhow::anyhow!("{name} is not installed in a trusted system path"))
+}
+
+#[cfg(target_os = "linux")]
+fn run_checked(program: &str, args: &[&str], action: &str) -> Result<()> {
+    use anyhow::Context;
+    use std::process::Command;
+
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("{action}: start {program}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if detail.is_empty() {
+        bail!("{action} failed with {}", output.status);
+    }
+    bail!("{action} failed: {detail}")
+}
+
 fn default_local_host() -> u8 {
     0
 }
@@ -240,12 +399,26 @@ mod platform {
     use super::*;
     use anyhow::{anyhow, Context};
     use hidapi::{HidApi, HidDevice};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::{Mutex as StdMutex, OnceLock};
     use std::time::{Duration, Instant};
 
     const HIDPP_USAGE_PAGES: [u16; 3] = [0xff00, 0xff43, 0xff0c];
     const HIDPP_LONG_USAGES: [u16; 2] = [0x0002, 0x0202];
+    const HIDPP10_ERROR: u8 = 0x8f;
+    const DEVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+    const READ_SLICE_TIMEOUT_MS: i32 = 100;
+    const INSPECT_ATTEMPTS: usize = 3;
     static SWITCH_CACHE: OnceLock<StdMutex<Option<FlowDevice>>> = OnceLock::new();
+    static NEXT_SOFTWARE_ID: AtomicU8 = AtomicU8::new(0x08);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ResponseMatch {
+        Data(Vec<u8>),
+        DeviceError(u8),
+        Unrelated,
+    }
 
     fn switch_cache() -> &'static StdMutex<Option<FlowDevice>> {
         SWITCH_CACHE.get_or_init(|| StdMutex::new(None))
@@ -269,17 +442,60 @@ mod platform {
         std::env::var_os("KBSHARE_FLOW_DEBUG").is_some()
     }
 
-    fn build_message(device_index: u8, request_id: u16, params: &[u8]) -> Result<[u8; 20]> {
+    fn next_software_id() -> u8 {
+        NEXT_SOFTWARE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if current >= 0x0f { 0x08 } else { current + 1 })
+            })
+            .unwrap_or(0x08)
+    }
+
+    fn build_message(
+        device_index: u8,
+        request_id: u16,
+        software_id: u8,
+        params: &[u8],
+    ) -> Result<[u8; 20]> {
         if params.len() > 16 {
             bail!("HID++ long report accepts at most 16 parameter bytes");
+        }
+        if !(0x08..=0x0f).contains(&software_id) {
+            bail!("HID++ software ID must be in 0x08..=0x0f");
         }
         let mut message = [0u8; 20];
         message[0] = REPORT_LONG;
         message[1] = device_index;
         message[2] = (request_id >> 8) as u8;
-        message[3] = (request_id as u8 & 0xf0) | SOFTWARE_ID;
+        message[3] = (request_id as u8 & 0xf0) | software_id;
         message[4..4 + params.len()].copy_from_slice(params);
         Ok(message)
+    }
+
+    fn match_response(response: &[u8], device_index: u8, expected: [u8; 2]) -> ResponseMatch {
+        if response.len() < 4
+            || !matches!(response[0], REPORT_SHORT | REPORT_LONG)
+            || (response[1] != device_index && response[1] != (device_index ^ 0xff))
+        {
+            return ResponseMatch::Unrelated;
+        }
+        if response[0] == REPORT_SHORT
+            && response.len() >= 6
+            && response[2] == HIDPP10_ERROR
+            && response[3..5] == expected
+        {
+            return ResponseMatch::DeviceError(response[5]);
+        }
+        if response[0] == REPORT_LONG
+            && response.len() >= 6
+            && response[2] == 0xff
+            && response[3..5] == expected
+        {
+            return ResponseMatch::DeviceError(response[5]);
+        }
+        if response[2..4] == expected {
+            return ResponseMatch::Data(response[4..].to_vec());
+        }
+        ResponseMatch::Unrelated
     }
 
     fn request(
@@ -288,7 +504,7 @@ mod platform {
         request_id: u16,
         params: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        let message = build_message(device_index, request_id, params)?;
+        let message = build_message(device_index, request_id, next_software_id(), params)?;
         let expected = [message[2], message[3]];
         let mut stale = [0u8; 32];
         while device.read_timeout(&mut stale, 0)? > 0 {}
@@ -297,27 +513,28 @@ mod platform {
             eprintln!("hid++ write slot={device_index:02x} bytes={written} {message:02x?}");
         }
 
-        let deadline = Instant::now() + Duration::from_millis(600);
+        let deadline = Instant::now() + DEVICE_REQUEST_TIMEOUT;
         let mut response = [0u8; 32];
         while Instant::now() < deadline {
             let read = device
-                .read_timeout(&mut response, 100)
+                .read_timeout(&mut response, READ_SLICE_TIMEOUT_MS)
                 .context("read HID++ report")?;
             if debug_enabled() && read > 0 {
                 eprintln!("hid++ read bytes={read} {:02x?}", &response[..read]);
             }
-            if read < 4 || response[0] != REPORT_LONG {
-                continue;
-            }
-            let response_index = response[1];
-            if response_index != device_index && response_index != (device_index ^ 0xff) {
-                continue;
-            }
-            if response[2] == 0xff && read >= 6 && response[3..5] == expected {
-                return Ok(None);
-            }
-            if response[2..4] == expected {
-                return Ok(Some(response[4..read].to_vec()));
+            match match_response(&response[..read], device_index, expected) {
+                ResponseMatch::Data(data) => return Ok(Some(data)),
+                ResponseMatch::DeviceError(code) => {
+                    if debug_enabled() {
+                        eprintln!(
+                            "hid++ device error slot={device_index:02x} \
+                             request={:02x}{:02x} code={code:02x}",
+                            expected[0], expected[1]
+                        );
+                    }
+                    return Ok(None);
+                }
+                ResponseMatch::Unrelated => {}
             }
         }
         Ok(None)
@@ -329,7 +546,7 @@ mod platform {
         request_id: u16,
         params: &[u8],
     ) -> Result<()> {
-        let message = build_message(device_index, request_id, params)?;
+        let message = build_message(device_index, request_id, next_software_id(), params)?;
         device.write(&message).context("write ChangeHost report")?;
         Ok(())
     }
@@ -426,6 +643,9 @@ mod platform {
     fn inspect_matching(selected_slot: Option<u8>) -> Result<Vec<FlowDevice>> {
         let api = HidApi::new().context("initialize hidapi")?;
         let mut devices = Vec::new();
+        let mut candidate_count = 0usize;
+        let mut opened_candidates = 0usize;
+        let mut open_errors = BTreeSet::new();
         for info in api.device_list() {
             if info.vendor_id() != LOGITECH_VENDOR_ID
                 || !is_candidate(info.usage_page(), info.usage())
@@ -440,9 +660,14 @@ mod platform {
                 ConnectionType::Direct
             };
             let path = info.path().to_string_lossy().into_owned();
+            candidate_count += 1;
             let device = match info.open_device(&api) {
-                Ok(device) => device,
+                Ok(device) => {
+                    opened_candidates += 1;
+                    device
+                }
                 Err(error) => {
+                    open_errors.insert(format!("{path}: {error}"));
                     if debug_enabled() {
                         eprintln!("hid++ open failed path={path}: {error}");
                     }
@@ -462,6 +687,17 @@ mod platform {
                 }
             }
         }
+        if devices.is_empty() && candidate_count > 0 && opened_candidates == 0 {
+            let details = open_errors.into_iter().collect::<Vec<_>>().join("; ");
+            #[cfg(target_os = "linux")]
+            bail!(
+                "found Logitech HID++ device, but could not open its hidraw node: {details}. \
+                 Install packaging/udev/70-kbshare-logitech.rules and reload udev rules, \
+                 or grant the current user read/write access to the listed node"
+            );
+            #[cfg(not(target_os = "linux"))]
+            bail!("found Logitech HID++ device, but could not open it: {details}");
+        }
         Ok(devices)
     }
 
@@ -470,19 +706,19 @@ mod platform {
     }
 
     pub fn inspect_with_fingerprint() -> Result<Vec<FlowDevice>> {
-        let devices = inspect_matching(None)?;
-        if !devices.is_empty() {
+        let mut devices = Vec::new();
+        for attempt in 0..INSPECT_ATTEMPTS {
+            devices = inspect_matching(None)?;
             if let Some(mouse) = devices.iter().find(|device| device.is_mouse()) {
                 remember_switch_device(mouse);
+                return Ok(devices);
             }
-            return Ok(devices);
-        }
-        // The first query can also wake a sleeping mouse. Retry the complete
-        // scan once so transient HID++ timeouts do not disable auto-setup.
-        std::thread::sleep(Duration::from_millis(150));
-        let devices = inspect_matching(None)?;
-        if let Some(mouse) = devices.iter().find(|device| device.is_mouse()) {
-            remember_switch_device(mouse);
+            if attempt + 1 < INSPECT_ATTEMPTS {
+                // A receiver can answer CONNECTION_REQUEST_FAILED while a
+                // sleeping wireless device is waking up. Retry the scan even
+                // if another ChangeHost-capable device was already found.
+                std::thread::sleep(Duration::from_millis(150));
+            }
         }
         Ok(devices)
     }
@@ -703,15 +939,48 @@ mod platform {
 
         #[test]
         fn change_host_report_uses_zero_based_host_id() {
-            let report = build_message(2, 0x0710, &[2]).unwrap();
+            let report = build_message(2, 0x0710, 0x08, &[2]).unwrap();
             assert_eq!(&report[..5], &[0x11, 0x02, 0x07, 0x18, 0x02]);
             assert_eq!(report.len(), 20);
         }
 
         #[test]
         fn root_query_contains_feature_code() {
-            let report = build_message(1, 0, &[0x18, 0x14, 0]).unwrap();
+            let report = build_message(1, 0, 0x08, &[0x18, 0x14, 0]).unwrap();
             assert_eq!(&report[..7], &[0x11, 0x01, 0x00, 0x08, 0x18, 0x14, 0x00]);
+        }
+
+        #[test]
+        fn short_hidpp10_error_matches_long_request() {
+            let response = [0x10, 0x01, 0x8f, 0x00, 0x0b, 0x04, 0x00];
+            assert_eq!(
+                match_response(&response, 0x01, [0x00, 0x0b]),
+                ResponseMatch::DeviceError(0x04)
+            );
+        }
+
+        #[test]
+        fn long_hidpp20_reply_returns_payload() {
+            let response = [
+                0x11, 0x01, 0x03, 0x2d, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ];
+            assert_eq!(
+                match_response(&response, 0x01, [0x03, 0x2d]),
+                ResponseMatch::Data(response[4..].to_vec())
+            );
+        }
+
+        #[test]
+        fn late_response_with_old_software_id_is_ignored() {
+            let response = [
+                0x11, 0x01, 0x00, 0x08, 0x0a, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ];
+            assert_eq!(
+                match_response(&response, 0x01, [0x00, 0x09]),
+                ResponseMatch::Unrelated
+            );
         }
     }
 }

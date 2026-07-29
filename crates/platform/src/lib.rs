@@ -38,7 +38,18 @@ pub trait KeyCapture: Send {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MouseActivity {
+    /// Compositor-confirmed desktop edge, when the activity came from a
+    /// Wayland InputCapture pointer barrier.
+    pub edge: Option<MouseEdge>,
     pub x: Option<i32>,
     pub y: Option<i32>,
     pub dx: Option<i32>,
@@ -51,6 +62,7 @@ pub struct MouseActivity {
 
 impl MouseActivity {
     pub const UNKNOWN: Self = Self {
+        edge: None,
         x: None,
         y: None,
         dx: None,
@@ -109,16 +121,25 @@ pub trait KeyInjector: Send {
 /// Factory: produce the default capture + watcher + injector for the running
 /// platform. Returns mock implementations on platforms with no real adapter.
 pub fn default_capture() -> Result<Box<dyn KeyCapture>> {
+    default_capture_with_shutdown(Arc::new(AtomicBool::new(false)))
+}
+
+/// Produce the default capture backend and allow interactive Wayland portal
+/// setup to be cancelled while the application is shutting down.
+pub fn default_capture_with_shutdown(shutdown: Arc<AtomicBool>) -> Result<Box<dyn KeyCapture>> {
     #[cfg(windows)]
     {
+        let _ = shutdown;
         return Ok(Box::new(win::WinKeyCapture::new()?));
     }
     #[cfg(target_os = "linux")]
     {
-        return linux::LinuxKeyCapture::new().map(|c| Box::new(c) as Box<dyn KeyCapture>);
+        return linux::LinuxKeyCapture::new_with_shutdown(shutdown)
+            .map(|c| Box::new(c) as Box<dyn KeyCapture>);
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
+        let _ = shutdown;
         Ok(Box::new(mock::MockKeyCapture::new()))
     }
 }
@@ -139,16 +160,25 @@ pub fn default_mouse_watcher() -> Result<Box<dyn MouseWatcher>> {
 }
 
 pub fn default_injector() -> Result<Box<dyn KeyInjector>> {
+    default_injector_with_shutdown(Arc::new(AtomicBool::new(false)))
+}
+
+/// Produce the default injector and allow long-running, interactive platform
+/// setup (such as a Wayland portal permission request) to be cancelled.
+pub fn default_injector_with_shutdown(shutdown: Arc<AtomicBool>) -> Result<Box<dyn KeyInjector>> {
     #[cfg(windows)]
     {
+        let _ = shutdown;
         return Ok(Box::new(win::WinKeyInjector::new()));
     }
     #[cfg(target_os = "linux")]
     {
-        return linux::LinuxKeyInjector::new().map(|c| Box::new(c) as Box<dyn KeyInjector>);
+        return linux::LinuxKeyInjector::new_with_shutdown(shutdown)
+            .map(|c| Box::new(c) as Box<dyn KeyInjector>);
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
+        let _ = shutdown;
         Ok(Box::new(mock::MockKeyInjector::new()))
     }
 }
@@ -160,6 +190,7 @@ mod tests {
     #[test]
     fn edge_detection_uses_virtual_desktop_bounds() {
         let activity = MouseActivity {
+            edge: None,
             x: Some(1917),
             y: Some(500),
             dx: Some(12),

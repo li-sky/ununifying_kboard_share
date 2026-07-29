@@ -22,4 +22,10 @@ once_cell = { workspace = true }
 windows-sys = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "=0.9.3", default-features = false, features = ["tokio"] }
 evdev = { workspace = true }
+futures-util = "0.3"
+libc = "0.2"
+reis = { version = "0.7", features = ["tokio"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+x11rb = "0.13"

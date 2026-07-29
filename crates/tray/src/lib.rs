@@ -4,8 +4,10 @@
 //! TLS, capture/inject, heartbeats) runs on a spawned worker thread and
 //! signals mode changes to the tray via a shared atomic.
 //!
-//! On non-Windows targets `run_tray` is a no-op shim that blocks until
-//! `shutdown` is set, so binaries that link this crate still build.
+//! Windows uses its native notification area and Linux uses the
+//! freedesktop StatusNotifierItem protocol. Other targets keep a headless
+//! compatibility shim.
+//! The browser-based configuration editor is available on every platform.
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -14,6 +16,10 @@ use std::sync::Arc;
 
 pub const MODE_LOCAL: u8 = 0;
 pub const MODE_REMOTE: u8 = 1;
+
+#[path = "platform/editor.rs"]
+mod editor;
+pub use editor::{launch as launch_config_editor, EditorEvent as ConfigEditorEvent};
 
 #[derive(Debug, Clone)]
 pub enum TrayExit {
@@ -42,8 +48,7 @@ pub struct TrayConfig {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    mod editor;
-    pub use editor::{launch as launch_config_editor, EditorEvent as ConfigEditorEvent};
+    use crate::editor;
     use image::ImageFormat;
     use std::io::Cursor;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -337,7 +342,331 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::*;
+    use crate::editor;
+    use ksni::menu::{MenuItem, StandardItem};
+    use std::process::Command;
+    use std::sync::mpsc::{self, Receiver, TryRecvError};
+    use std::time::Duration;
+
+    #[derive(Debug, Clone, Copy)]
+    enum Action {
+        ShowFingerprint,
+        OpenLogs,
+        LoadConfig,
+        EditConfig,
+        OpenConfigDir,
+        Quit,
+    }
+
+    struct LinuxTray {
+        cfg: TrayConfig,
+        mode: u8,
+        actions: mpsc::Sender<Action>,
+    }
+
+    impl LinuxTray {
+        fn status_label(&self) -> &'static str {
+            if self.cfg.waiting_for_peer {
+                "Registered · Waiting"
+            } else if self.mode == MODE_REMOTE {
+                "Remote"
+            } else {
+                "Local"
+            }
+        }
+
+        fn item(&self, label: impl Into<String>, enabled: bool, action: Action) -> MenuItem<Self> {
+            StandardItem {
+                label: label.into(),
+                enabled,
+                activate: Box::new(move |tray: &mut Self| {
+                    let _ = tray.actions.send(action);
+                }),
+                ..Default::default()
+            }
+            .into()
+        }
+    }
+
+    impl ksni::Tray for LinuxTray {
+        fn id(&self) -> String {
+            self.cfg.app_name.clone()
+        }
+
+        fn title(&self) -> String {
+            format!("{} — {}", self.cfg.app_name, self.status_label())
+        }
+
+        fn icon_name(&self) -> String {
+            if self.cfg.waiting_for_peer {
+                "network-idle".into()
+            } else if self.mode == MODE_REMOTE {
+                "network-transmit-receive".into()
+            } else {
+                "input-keyboard".into()
+            }
+        }
+
+        fn tool_tip(&self) -> ksni::ToolTip {
+            ksni::ToolTip {
+                icon_name: self.icon_name(),
+                title: self.title(),
+                description: format!("id: {}", self.cfg.local_id),
+                ..Default::default()
+            }
+        }
+
+        fn activate(&mut self, _x: i32, _y: i32) {
+            let _ = self.actions.send(Action::EditConfig);
+        }
+
+        fn menu(&self) -> Vec<MenuItem<Self>> {
+            vec![
+                StandardItem {
+                    label: format!("● {} — {}", self.cfg.app_name, self.status_label()),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: format!("id: {}", self.cfg.local_id),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+                MenuItem::Separator,
+                self.item("Show fingerprint…", true, Action::ShowFingerprint),
+                self.item(
+                    "Open log folder",
+                    self.cfg.log_dir.is_some(),
+                    Action::OpenLogs,
+                ),
+                self.item("Load config file…", true, Action::LoadConfig),
+                self.item(
+                    "Edit configuration…",
+                    self.cfg.config_path.is_some(),
+                    Action::EditConfig,
+                ),
+                self.item(
+                    "Open config folder",
+                    self.cfg.config_dir.is_some(),
+                    Action::OpenConfigDir,
+                ),
+                MenuItem::Separator,
+                self.item("Quit", true, Action::Quit),
+            ]
+        }
+    }
+
+    fn show_message(app_name: &str, title: &str, body: &str) {
+        let notified = Command::new("notify-send")
+            .arg("--app-name")
+            .arg(app_name)
+            .arg(title)
+            .arg(body)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !notified {
+            eprintln!("{title}\n{body}");
+        }
+    }
+
+    fn open_path(app_name: &str, path: &std::path::Path, description: &str) {
+        if let Err(error) = open::that_detached(path) {
+            show_message(
+                app_name,
+                &format!("Could not open {description}"),
+                &error.to_string(),
+            );
+        }
+    }
+
+    fn receive_editor_event(
+        events: &mut Option<Receiver<editor::EditorEvent>>,
+        app_name: &str,
+    ) -> Option<PathBuf> {
+        let Some(receiver) = events else {
+            return None;
+        };
+        match receiver.try_recv() {
+            Ok(editor::EditorEvent::Saved(path)) => Some(path),
+            Ok(editor::EditorEvent::Failed(error)) => {
+                show_message(app_name, "Configuration editor failed", &error);
+                *events = None;
+                None
+            }
+            Err(TryRecvError::Disconnected) => {
+                *events = None;
+                None
+            }
+            Err(TryRecvError::Empty) => None,
+        }
+    }
+
+    pub fn run_tray(
+        cfg: TrayConfig,
+        mode: Arc<AtomicU8>,
+        session_active: Arc<AtomicBool>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<TrayExit> {
+        let (action_sender, action_receiver) = mpsc::channel();
+        let initial_mode = mode.load(Ordering::Relaxed);
+        let service = ksni::TrayService::new(LinuxTray {
+            cfg: cfg.clone(),
+            mode: initial_mode,
+            actions: action_sender,
+        });
+        let handle = service.handle();
+        let tray_thread = std::thread::Builder::new()
+            .name("linux-status-notifier".into())
+            .spawn(move || {
+                if let Err(error) = service.run() {
+                    tracing::warn!(error = %error, "Linux status notifier unavailable");
+                }
+            })?;
+
+        tracing::info!("Linux status notifier started");
+        let mut shown_mode = initial_mode;
+        let mut exit_action = TrayExit::Quit;
+        let mut editor_events = None;
+
+        while !shutdown.load(Ordering::Relaxed) {
+            while let Ok(action) = action_receiver.try_recv() {
+                match action {
+                    Action::ShowFingerprint => show_message(
+                        &cfg.app_name,
+                        &format!("{} fingerprint", cfg.app_name),
+                        &format!("id: {}\nSHA256: {}", cfg.local_id, cfg.fingerprint),
+                    ),
+                    Action::OpenLogs => {
+                        if let Some(dir) = &cfg.log_dir {
+                            open_path(&cfg.app_name, dir, "log folder");
+                        }
+                    }
+                    Action::LoadConfig => {
+                        if editor_events.is_none() {
+                            if let Some(path) = &cfg.config_path {
+                                match editor::launch_import(
+                                    path.clone(),
+                                    cfg.app_name.clone(),
+                                    session_active.clone(),
+                                ) {
+                                    Ok(events) => editor_events = Some(events),
+                                    Err(error) => show_message(
+                                        &cfg.app_name,
+                                        "Could not open configuration importer",
+                                        &format!("{error:#}"),
+                                    ),
+                                }
+                            }
+                        } else {
+                            show_message(
+                                &cfg.app_name,
+                                "Configuration editor",
+                                "The configuration editor is already open. Use “Load config file…” there.",
+                            );
+                        }
+                    }
+                    Action::EditConfig => {
+                        if editor_events.is_none() {
+                            if let Some(path) = &cfg.config_path {
+                                match editor::launch(
+                                    path.clone(),
+                                    cfg.app_name.clone(),
+                                    session_active.clone(),
+                                ) {
+                                    Ok(events) => editor_events = Some(events),
+                                    Err(error) => show_message(
+                                        &cfg.app_name,
+                                        "Could not open configuration editor",
+                                        &format!("{error:#}"),
+                                    ),
+                                }
+                            }
+                        } else {
+                            show_message(
+                                &cfg.app_name,
+                                "Configuration editor",
+                                "The configuration editor is already open in your browser.",
+                            );
+                        }
+                    }
+                    Action::OpenConfigDir => {
+                        if let Some(dir) = &cfg.config_dir {
+                            open_path(&cfg.app_name, dir, "config folder");
+                        }
+                    }
+                    Action::Quit => shutdown.store(true, Ordering::Relaxed),
+                }
+            }
+
+            if let Some(path) = receive_editor_event(&mut editor_events, &cfg.app_name) {
+                exit_action = TrayExit::ReloadConfig(path);
+                shutdown.store(true, Ordering::Relaxed);
+            }
+
+            let current_mode = mode.load(Ordering::Relaxed);
+            if current_mode != shown_mode {
+                shown_mode = current_mode;
+                handle.update(|tray| tray.mode = current_mode);
+            }
+
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        handle.shutdown();
+        let _ = tray_thread.join();
+        Ok(exit_action)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use ksni::Tray;
+
+        #[test]
+        fn menu_exposes_the_windows_baseline_actions() {
+            let (actions, _) = mpsc::channel();
+            let tray = LinuxTray {
+                cfg: TrayConfig {
+                    app_name: "kbshare".into(),
+                    local_id: "desktop".into(),
+                    fingerprint: "abc123".into(),
+                    config_path: Some(PathBuf::from("config.json")),
+                    config_dir: Some(PathBuf::from(".")),
+                    log_dir: Some(PathBuf::from("logs")),
+                    waiting_for_peer: false,
+                },
+                mode: MODE_LOCAL,
+                actions,
+            };
+            let labels = tray
+                .menu()
+                .into_iter()
+                .filter_map(|item| match item {
+                    MenuItem::Standard(item) => Some(item.label),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            for expected in [
+                "Show fingerprint…",
+                "Open log folder",
+                "Load config file…",
+                "Edit configuration…",
+                "Open config folder",
+                "Quit",
+            ] {
+                assert!(labels.iter().any(|label| label == expected), "{expected}");
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod platform {
     use super::*;
     use std::time::Duration;
@@ -357,5 +686,3 @@ mod platform {
 }
 
 pub use platform::run_tray;
-#[cfg(windows)]
-pub use platform::{launch_config_editor, ConfigEditorEvent};

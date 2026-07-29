@@ -4,7 +4,8 @@
 
 ## 设计要点
 
-- **语言**：Rust（blocking I/O + std::thread；不引入 tokio 以降低噪声）。
+- **语言**：Rust（主体使用 blocking I/O + `std::thread`；Wayland portal
+  适配器在独立线程内运行一个单线程异步循环）。
 - **分层**：
   - `core` —— 纯逻辑，零 I/O。键码映射、状态机、按键跟踪、协议编解码。
   - `net`  —— TLS + 自签证书 + SHA256 指纹 TOFU + 极简注册表客户端。
@@ -53,6 +54,12 @@ ununifying_kboard_share/
 ```powershell
 cargo build
 cargo test
+```
+
+Linux 构建需要 udev 和 D-Bus 开发包（包名以 Debian/Ubuntu 为例）：
+
+```bash
+sudo apt install pkg-config libudev-dev libdbus-1-dev
 ```
 
 ## 本地运行
@@ -204,7 +211,13 @@ kbshare 启动时会：
 
 ## 配置编辑器
 
-Windows 托盘菜单选择 **Edit configuration…** 会在默认浏览器打开配置界面。
+Windows 和 Linux 首次启动遇到空配置时，都会在默认浏览器打开相同的交互式配置向导。
+Windows 托盘菜单选择 **Edit configuration…** 也会打开该界面。
+Linux 状态栏通过 freedesktop StatusNotifierItem 提供相同的状态、指纹、加载配置、
+编辑配置、打开日志/配置目录和退出入口；GNOME 需要启用 AppIndicator/KStatusNotifierItem
+扩展，KDE Plasma 原生支持。
+Linux 的目录和浏览器入口通过 `xdg-open` 打开；加载配置使用浏览器原生文件选择器，
+导入 JSON 后检查并保存即可重启应用。
 点击 **Setup guide** 后按“本机名称 → 生成/确认 TLS 证书 → 云端发现对端（或手动 IP）→ 鼠标探测与通道 → 设备布局 → 检查应用”完成配置。
 证书步骤会显示 SHA-256 指纹；若配置路径已有证书和私钥则只校验并复用，不会覆盖。
 鼠标探测不是强制步骤；蓝牙设备或当前切换到另一通道的鼠标可以手动填写。
@@ -213,38 +226,71 @@ Windows 托盘菜单选择 **Edit configuration…** 会在默认浏览器打开
 
 开发时也可以单独启动编辑器：
 
-```powershell
+```bash
 cargo run -p kbshare-tray --bin kbshare-config -- runtime_alpha/config.json kbshare
 ```
 
 编辑器仅监听随机的 `127.0.0.1` 端口，并为每次启动生成一次性 URL。
+如果系统无法自动唤起浏览器，终端会打印该 URL，可手动复制打开。
 
 ## Flow-lite（Logitech Easy-Switch）
 
 先在连接鼠标的机器上只读探测 HID++ 设备：
 
 ```powershell
-cargo run -p kbshare-flow -- inspect
+cargo run -p kbshare-flow --bin kbshare-flow -- inspect
 ```
 
 Windows 和 Linux 都支持 HID++ 探测与切换。Linux 通过 `/dev/hidraw*`
-访问设备；当前用户必须对 Logitech hidraw 节点有读写权限。桌面 Linux
-可以添加以下 udev 规则：
+访问设备；当前用户必须对 Logitech hidraw 节点有读写权限。仓库提供了
+适用于 USB 接收器、USB 直连和蓝牙设备的 udev 规则：
 
-```udev
-# /etc/udev/rules.d/70-kbshare-logitech.rules
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", MODE="0660", GROUP="input", TAG+="uaccess"
-```
+Linux 配置界面的 Flow-Lite 页面可点击 **Install Linux HID access…**。程序会
+通过 Polkit 调起桌面认证窗口；授权后由最小化的特权 helper 原子安装规则、重新
+加载 udev 并立即重新探测鼠标。配置服务本身始终以普通用户运行。
 
 ```bash
+sudo install -Dm644 packaging/udev/70-kbshare-logitech.rules \
+  /etc/udev/rules.d/70-kbshare-logitech.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=hidraw
-sudo usermod -aG input "$USER"
 ```
 
-重新登录后运行 `cargo run -p kbshare-flow -- collections` 检查设备集合。
+发行包还应安装 `packaging/polkit/org.kbshare.install-udev.policy` 到
+`/usr/share/polkit-1/actions/`，以显示 kbshare 专用的认证动作；开发目录直接运行
+时会回退到 Polkit 的通用 `pkexec` 动作。
+
+重新插拔接收器后运行 `cargo run -p kbshare-flow --bin kbshare-flow -- collections`
+检查设备集合，再运行 `cargo run -p kbshare-flow --bin kbshare-flow -- inspect`
+探测鼠标。探测时应唤醒或移动无线鼠标；接收器在鼠标休眠时可能暂时返回
+`CONNECTION_REQUEST_FAILED`，程序会自动重试。若仍无结果，设置
+`KBSHARE_FLOW_DEBUG=1` 可输出 HID++ 请求和响应。
 WSL 不会自动暴露 Windows USB 设备；接收器需要先通过 USB 透传连接到 WSL，
 并确认发行版中出现 `/dev/hidraw*`，之后 Flow-lite 的操作与普通 Linux 相同。
+
+Linux 的 Flow 边缘判断按桌面协议自动选择实现：
+
+- Wayland 使用 `org.freedesktop.portal.InputCapture` 的 pointer barriers，并通过
+  EIS/libei receiver 完成标准会话握手。屏幕区域、多屏外边界、显示器热插拔均由
+  compositor 报告，不读取也不推测全局坐标；触发后立即释放捕获并把指针放回本机
+  边界内侧。
+- X11/XWayland 保留全局光标查询作为兼容回退。
+
+Wayland 桌面必须安装 `xdg-desktop-portal` 及支持 InputCapture 的桌面 portal
+后端；首次使用时按桌面提示授权。如果 portal 不提供该接口，日志会明确说明并尝试
+X11/XWayland 回退。
+
+Linux 键盘注入同样按会话选择后端。Wayland 优先通过
+`org.freedesktop.portal.RemoteDesktop` 授权，并使用 libei sender 把 evdev
+keycode 交给 compositor；成功时不访问 `/dev/uinput`。非 Wayland 会话以及 portal
+不可用时保留 uinput 回退。若两者均不可用，启动错误会同时列出 portal 和 uinput
+失败原因。授权对话框尚未完成时退出应用，会取消等待而不会卡住引擎线程。
+
+键盘捕获与 Flow barrier 共用一个 InputCapture/libei receiver 会话。Wayland
+成功授权后不读取 `/dev/input/event*`：越过指向对端的屏幕边缘时 compositor
+开始截获键盘，指针向本机方向退回或对端返回时释放。`flow_lite.enabled=false`
+时仍可使用这种“仅键盘远程”模式，只跳过 Logitech HID 切换。Portal 不可用时才
+回退 evdev；若 evdev 也不可读，错误会同时列出两条捕获路径的失败原因。
 
 `flow_lite.enabled` 开启后，鼠标从布局中指向当前对端的屏幕边缘切换机器；
 默认布局是本机在左、对端在右。host 编号从 0 开始，因此设备 3 的
