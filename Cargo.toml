@@ -36,7 +36,7 @@ tiny_http = "0.12"
 clap = { version = "4", features = ["derive"] }
 once_cell = "1"
 if-addrs = "0.15"
-clipboard-rs = { version = "0.3.5", default-features = false, features = ["wayland"] }
+clipboard-rs = { version = "0.3.5", default-features = false, features = ["image", "wayland"] }
 base64 = "0.22"
 url = "2"
 

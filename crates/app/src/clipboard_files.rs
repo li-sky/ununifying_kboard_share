@@ -12,7 +12,15 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_FILES: usize = 32;
 pub const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const FILE_CHUNK_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferPurpose {
+    Files,
+    Image,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMeta {
@@ -25,6 +33,7 @@ pub struct FileMeta {
 pub enum FileTransferMessage {
     Offer {
         transfer_id: u64,
+        purpose: TransferPurpose,
         files: Vec<FileMeta>,
     },
     Chunk {
@@ -110,9 +119,57 @@ impl FileTransfers {
         transfer_id: u64,
         paths: Vec<PathBuf>,
     ) -> Result<FileTransferMessage> {
-        let transfer = OutboundTransfer::new(transfer_id, paths)?;
+        self.begin_outbound_paths(transfer_id, TransferPurpose::Files, paths, None)
+    }
+
+    pub fn begin_image_outbound(
+        &mut self,
+        transfer_id: u64,
+        png: &[u8],
+    ) -> Result<FileTransferMessage> {
+        if png.is_empty() {
+            bail!("clipboard image is empty");
+        }
+        if png.len() > MAX_IMAGE_BYTES {
+            bail!("clipboard image exceeds the {} byte limit", MAX_IMAGE_BYTES);
+        }
+
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create clipboard root {}", self.root.display()))?;
+        let directory = self.root.join(format!("outbound-{transfer_id:016x}"));
+        std::fs::create_dir(&directory)
+            .with_context(|| format!("create clipboard image transfer {}", directory.display()))?;
+        let path = directory.join("clipboard.png");
+        if let Err(error) = std::fs::write(&path, png) {
+            let _ = std::fs::remove_dir_all(&directory);
+            return Err(error).with_context(|| format!("write clipboard image {}", path.display()));
+        }
+
+        match self.begin_outbound_paths(
+            transfer_id,
+            TransferPurpose::Image,
+            vec![path],
+            Some(directory.clone()),
+        ) {
+            Ok(offer) => Ok(offer),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(directory);
+                Err(error)
+            }
+        }
+    }
+
+    fn begin_outbound_paths(
+        &mut self,
+        transfer_id: u64,
+        purpose: TransferPurpose,
+        paths: Vec<PathBuf>,
+        cleanup_directory: Option<PathBuf>,
+    ) -> Result<FileTransferMessage> {
+        let transfer = OutboundTransfer::new(transfer_id, paths, cleanup_directory)?;
         let offer = FileTransferMessage::Offer {
             transfer_id,
+            purpose,
             files: transfer.files.clone(),
         };
         self.outbound = Some(transfer);
@@ -128,9 +185,18 @@ impl FileTransfers {
 
     pub fn receive(&mut self, message: FileTransferMessage) -> Result<Option<ReceivedFiles>> {
         match message {
-            FileTransferMessage::Offer { transfer_id, files } => {
+            FileTransferMessage::Offer {
+                transfer_id,
+                purpose,
+                files,
+            } => {
                 self.cancel_inbound();
-                self.inbound = Some(InboundTransfer::create(&self.root, transfer_id, files)?);
+                self.inbound = Some(InboundTransfer::create(
+                    &self.root,
+                    transfer_id,
+                    purpose,
+                    files,
+                )?);
                 Ok(None)
             }
             FileTransferMessage::Cancel { transfer_id, .. } => {
@@ -171,6 +237,7 @@ impl FileTransfers {
                     let transfer = self.inbound.take().expect("inbound transfer exists");
                     Ok(Some(ReceivedFiles {
                         transfer_id: transfer.id,
+                        purpose: transfer.purpose,
                         directory: transfer.directory,
                         paths: transfer.files.into_iter().map(|file| file.path).collect(),
                     }))
@@ -184,6 +251,7 @@ impl FileTransfers {
 
 pub struct ReceivedFiles {
     pub transfer_id: u64,
+    pub purpose: TransferPurpose,
     pub directory: PathBuf,
     pub paths: Vec<PathBuf>,
 }
@@ -192,6 +260,7 @@ struct OutboundTransfer {
     id: u64,
     files: Vec<FileMeta>,
     paths: Vec<PathBuf>,
+    cleanup_directory: Option<PathBuf>,
     file_index: usize,
     open_file: Option<File>,
     offset: u64,
@@ -199,8 +268,16 @@ struct OutboundTransfer {
     complete_sent: bool,
 }
 
+impl Drop for OutboundTransfer {
+    fn drop(&mut self) {
+        if let Some(directory) = self.cleanup_directory.take() {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+}
+
 impl OutboundTransfer {
-    fn new(id: u64, paths: Vec<PathBuf>) -> Result<Self> {
+    fn new(id: u64, paths: Vec<PathBuf>, cleanup_directory: Option<PathBuf>) -> Result<Self> {
         if paths.is_empty() {
             bail!("clipboard contains no transferable files");
         }
@@ -247,6 +324,7 @@ impl OutboundTransfer {
             id,
             files,
             paths: normalized,
+            cleanup_directory,
             file_index: 0,
             open_file: None,
             offset: 0,
@@ -314,6 +392,7 @@ impl OutboundTransfer {
 
 struct InboundTransfer {
     id: u64,
+    purpose: TransferPurpose,
     directory: PathBuf,
     files: Vec<InboundFile>,
     current_file: usize,
@@ -328,8 +407,13 @@ struct InboundFile {
 }
 
 impl InboundTransfer {
-    fn create(root: &Path, id: u64, files: Vec<FileMeta>) -> Result<Self> {
-        validate_manifest(&files)?;
+    fn create(
+        root: &Path,
+        id: u64,
+        purpose: TransferPurpose,
+        files: Vec<FileMeta>,
+    ) -> Result<Self> {
+        validate_manifest(purpose, &files)?;
         std::fs::create_dir_all(root)
             .with_context(|| format!("create clipboard root {}", root.display()))?;
         let directory = root.join(format!("{id:016x}"));
@@ -357,6 +441,7 @@ impl InboundTransfer {
         match result {
             Ok(files) => Ok(Self {
                 id,
+                purpose,
                 directory,
                 files,
                 current_file: 0,
@@ -451,9 +536,16 @@ impl InboundTransfer {
     }
 }
 
-fn validate_manifest(files: &[FileMeta]) -> Result<()> {
+fn validate_manifest(purpose: TransferPurpose, files: &[FileMeta]) -> Result<()> {
     if files.is_empty() || files.len() > MAX_FILES {
         bail!("invalid clipboard file count");
+    }
+    if purpose == TransferPurpose::Image
+        && (files.len() != 1
+            || files[0].name != "clipboard.png"
+            || files[0].size > MAX_IMAGE_BYTES as u64)
+    {
+        bail!("invalid clipboard image manifest");
     }
     let mut total = 0_u64;
     let mut names = HashSet::new();
@@ -591,10 +683,67 @@ mod tests {
 
     #[test]
     fn rejects_manifest_path_traversal() {
-        assert!(validate_manifest(&[FileMeta {
-            name: "../escape".into(),
-            size: 1,
-        }])
+        assert!(validate_manifest(
+            TransferPurpose::Files,
+            &[FileMeta {
+                name: "../escape".into(),
+                size: 1,
+            }]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn streams_image_payload_with_image_purpose() {
+        let expected = (0..(FILE_CHUNK_BYTES + 137))
+            .map(|index| (index % 239) as u8)
+            .collect::<Vec<_>>();
+        let mut sender = FileTransfers::new("receiver-image-test");
+        let mut receiver = FileTransfers::new("sender-image-test");
+        let offer = sender.begin_image_outbound(77, &expected).unwrap();
+        assert!(matches!(
+            offer,
+            FileTransferMessage::Offer {
+                purpose: TransferPurpose::Image,
+                ..
+            }
+        ));
+        receiver.receive(offer).unwrap();
+        let received = loop {
+            let message = sender.next_outbound().unwrap().unwrap();
+            if let Some(received) = receiver.receive(message).unwrap() {
+                break received;
+            }
+        };
+        assert_eq!(received.purpose, TransferPurpose::Image);
+        assert_eq!(received.paths.len(), 1);
+        assert_eq!(std::fs::read(&received.paths[0]).unwrap(), expected);
+        sender
+            .receive(FileTransferMessage::Accepted {
+                transfer_id: received.transfer_id,
+            })
+            .unwrap();
+        assert!(!sender.has_outbound());
+        let _ = std::fs::remove_dir_all(received.directory);
+    }
+
+    #[test]
+    fn rejects_invalid_image_manifest() {
+        assert!(validate_manifest(
+            TransferPurpose::Image,
+            &[FileMeta {
+                name: "not-an-image.bin".into(),
+                size: 1,
+            }]
+        )
+        .is_err());
+        assert!(validate_manifest(
+            TransferPurpose::Image,
+            &[FileMeta {
+                name: "clipboard.png".into(),
+                size: MAX_IMAGE_BYTES as u64 + 1,
+            }]
+        )
         .is_err());
     }
 

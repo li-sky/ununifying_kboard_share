@@ -9,8 +9,8 @@
 mod files;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clipboard_rs::{Clipboard, ClipboardContext};
-use files::{FileTransferMessage, FileTransfers};
+use clipboard_rs::{common::RustImage, Clipboard, ClipboardContext, ContentFormat, RustImageData};
+use files::{FileTransferMessage, FileTransfers, TransferPurpose};
 use kbshare_net::registry::RegistryClient;
 use kbshare_net::session::{client_handshake, server_handshake};
 use kbshare_net::trust::{AutoTrustPolicy, TrustDecision, TrustStore};
@@ -25,11 +25,12 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const CLIPBOARD_PROTOCOL_VERSION: u32 = 2;
+const CLIPBOARD_PROTOCOL_VERSION: u32 = 3;
 const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 // JSON may encode one control byte as a six-byte `\u00xx` escape.
 const MAX_FRAME_BYTES: usize = MAX_CLIPBOARD_BYTES * 6 + 4096;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const IMAGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const IO_TIMEOUT: Duration = Duration::from_millis(20);
 const IDLE_SLEEP: Duration = Duration::from_millis(20);
 const RETAINED_FILE_TRANSFERS: usize = 3;
@@ -67,7 +68,7 @@ enum ClipboardMessage {
         sequence: u64,
         text: String,
     },
-    Files {
+    Transfer {
         id: String,
         message: FileTransferMessage,
     },
@@ -89,6 +90,7 @@ struct ClipboardState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClipboardSnapshot {
     Text(String),
+    Image(Vec<u8>),
     Files(Vec<PathBuf>),
 }
 
@@ -96,7 +98,7 @@ impl ClipboardState {
     fn open(peer_id: &str) -> Result<Self> {
         let clipboard =
             ClipboardContext::new().map_err(|error| anyhow!("open system clipboard: {error}"))?;
-        let last_observed = observe_clipboard(&clipboard);
+        let last_observed = observe_clipboard(&clipboard, true);
         Ok(Self {
             clipboard,
             last_observed,
@@ -295,6 +297,9 @@ fn run_session(
     let mut last_poll = Instant::now()
         .checked_sub(POLL_INTERVAL)
         .unwrap_or_else(Instant::now);
+    let mut last_image_poll = Instant::now()
+        .checked_sub(IMAGE_POLL_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     tracing::info!("clipboard TLS session connected");
     while !shutdown.load(Ordering::Relaxed) {
@@ -318,12 +323,16 @@ fn run_session(
         if verified {
             if last_poll.elapsed() >= POLL_INTERVAL {
                 last_poll = Instant::now();
-                if let Some(current) = observe_clipboard(&clipboard.clipboard) {
+                let include_image = last_image_poll.elapsed() >= IMAGE_POLL_INTERVAL;
+                if include_image {
+                    last_image_poll = Instant::now();
+                }
+                if let Some(current) = observe_clipboard(&clipboard.clipboard, include_image) {
                     if clipboard.last_observed.as_ref() != Some(&current) {
                         if let Some(cancel) =
                             clipboard.transfers.cancel_outbound("clipboard changed")
                         {
-                            send_file_message(&mut stream, config, cancel)?;
+                            send_transfer_message(&mut stream, config, cancel)?;
                         }
                         send_clipboard_change(&mut stream, config, clipboard, current)?;
                     }
@@ -333,9 +342,9 @@ fn run_session(
             match clipboard.transfers.next_outbound() {
                 Ok(Some(message)) => {
                     let completed = matches!(message, FileTransferMessage::Complete { .. });
-                    send_file_message(&mut stream, config, message)?;
+                    send_transfer_message(&mut stream, config, message)?;
                     if completed {
-                        tracing::info!("clipboard file transfer sent; waiting for peer validation");
+                        tracing::info!("clipboard payload sent; waiting for peer validation");
                     }
                 }
                 Ok(None) => {}
@@ -345,7 +354,7 @@ fn run_session(
                         .transfers
                         .cancel_outbound("source file changed or became unavailable")
                     {
-                        send_file_message(&mut stream, config, cancel)?;
+                        send_transfer_message(&mut stream, config, cancel)?;
                     }
                 }
             }
@@ -380,39 +389,67 @@ fn handle_incoming(
             }
             Ok(())
         }
-        ClipboardMessage::Files { id, message } if id == config.remote_id => {
+        ClipboardMessage::Transfer { id, message } if id == config.remote_id => {
             let is_offer = matches!(&message, FileTransferMessage::Offer { .. });
             let is_accepted = matches!(&message, FileTransferMessage::Accepted { .. });
             match clipboard.transfers.receive(message) {
                 Ok(Some(received)) => {
                     let transfer_id = received.transfer_id;
+                    let purpose = received.purpose;
                     let directory = received.directory;
                     let paths = received.paths;
-                    let clipboard_paths = paths
-                        .iter()
-                        .map(|path| clipboard_file_value(path))
-                        .collect::<Vec<_>>();
-                    if let Err(error) = clipboard.clipboard.set_files(clipboard_paths) {
-                        let _ = std::fs::remove_dir_all(&directory);
-                        return Err(anyhow!("write received files to system clipboard: {error}"));
+                    match purpose {
+                        TransferPurpose::Files => {
+                            let clipboard_paths = paths
+                                .iter()
+                                .map(|path| clipboard_file_value(path))
+                                .collect::<Vec<_>>();
+                            if let Err(error) = clipboard.clipboard.set_files(clipboard_paths) {
+                                let _ = std::fs::remove_dir_all(&directory);
+                                return Err(anyhow!(
+                                    "write received files to system clipboard: {error}"
+                                ));
+                            }
+                            clipboard.last_observed = Some(ClipboardSnapshot::Files(paths.clone()));
+                            clipboard.retain_received_directory(directory);
+                            tracing::info!(
+                                files = paths.len(),
+                                "received clipboard files are ready to paste"
+                            );
+                        }
+                        TransferPurpose::Image => {
+                            let result = (|| -> Result<Vec<u8>> {
+                                let path = paths
+                                    .first()
+                                    .context("received clipboard image has no payload")?;
+                                let png = std::fs::read(path).with_context(|| {
+                                    format!("read received clipboard image {}", path.display())
+                                })?;
+                                let image = RustImageData::from_bytes(&png).map_err(|error| {
+                                    anyhow!("decode received clipboard image: {error}")
+                                })?;
+                                clipboard.clipboard.set_image(image).map_err(|error| {
+                                    anyhow!("write received image to system clipboard: {error}")
+                                })?;
+                                Ok(png)
+                            })();
+                            let _ = std::fs::remove_dir_all(&directory);
+                            let png = result?;
+                            clipboard.last_observed = Some(ClipboardSnapshot::Image(png));
+                            tracing::info!("applied clipboard image received from peer");
+                        }
                     }
-                    clipboard.last_observed = Some(ClipboardSnapshot::Files(paths.clone()));
-                    clipboard.retain_received_directory(directory);
-                    send_file_message(
+                    send_transfer_message(
                         stream,
                         config,
                         FileTransferMessage::Accepted { transfer_id },
                     )?;
-                    tracing::info!(
-                        files = paths.len(),
-                        "received clipboard files are ready to paste"
-                    );
                 }
                 Ok(None) => {
                     if is_offer {
-                        tracing::info!("receiving clipboard files from peer");
+                        tracing::info!("receiving clipboard payload from peer");
                     } else if is_accepted {
-                        tracing::info!("peer validated clipboard file transfer");
+                        tracing::info!("peer validated clipboard payload");
                     }
                 }
                 Err(error) => {
@@ -423,7 +460,7 @@ fn handle_incoming(
             Ok(())
         }
         ClipboardMessage::Hello { .. } => bail!("unexpected second clipboard Hello"),
-        ClipboardMessage::Text { .. } | ClipboardMessage::Files { .. } => {
+        ClipboardMessage::Text { .. } | ClipboardMessage::Transfer { .. } => {
             bail!("clipboard message came from an unexpected peer")
         }
     }
@@ -456,6 +493,23 @@ fn send_clipboard_change(
                 );
             }
         }
+        ClipboardSnapshot::Image(png) => {
+            clipboard.sequence = clipboard.sequence.wrapping_add(1);
+            let transfer_id = new_transfer_id(clipboard.sequence);
+            match clipboard.transfers.begin_image_outbound(transfer_id, png) {
+                Ok(offer) => {
+                    send_transfer_message(stream, config, offer)?;
+                    tracing::info!(
+                        bytes = png.len(),
+                        transfer_id,
+                        "sending clipboard image to peer"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "clipboard image cannot be shared");
+                }
+            }
+        }
         ClipboardSnapshot::Files(paths) => {
             clipboard.sequence = clipboard.sequence.wrapping_add(1);
             let transfer_id = new_transfer_id(clipboard.sequence);
@@ -464,7 +518,7 @@ fn send_clipboard_change(
                 .begin_outbound(transfer_id, paths.clone())
             {
                 Ok(offer) => {
-                    send_file_message(stream, config, offer)?;
+                    send_transfer_message(stream, config, offer)?;
                     tracing::info!(
                         files = paths.len(),
                         transfer_id,
@@ -481,21 +535,24 @@ fn send_clipboard_change(
     Ok(())
 }
 
-fn send_file_message(
+fn send_transfer_message(
     stream: &mut Box<dyn ClipboardIo>,
     config: &ClipboardConfig,
     message: FileTransferMessage,
 ) -> Result<()> {
     send(
         stream,
-        &ClipboardMessage::Files {
+        &ClipboardMessage::Transfer {
             id: config.local_id.clone(),
             message,
         },
     )
 }
 
-fn observe_clipboard(clipboard: &ClipboardContext) -> Option<ClipboardSnapshot> {
+fn observe_clipboard(
+    clipboard: &ClipboardContext,
+    include_image: bool,
+) -> Option<ClipboardSnapshot> {
     if let Ok(files) = clipboard.get_files() {
         let paths = files
             .iter()
@@ -504,6 +561,21 @@ fn observe_clipboard(clipboard: &ClipboardContext) -> Option<ClipboardSnapshot> 
         if !paths.is_empty() {
             return Some(ClipboardSnapshot::Files(paths));
         }
+    }
+    let has_image = clipboard.has(ContentFormat::Image);
+    if include_image {
+        match clipboard.get_image() {
+            Ok(image) => {
+                let png = image.to_png().ok()?;
+                return Some(ClipboardSnapshot::Image(png.get_bytes().to_vec()));
+            }
+            Err(_) if has_image => return None,
+            Err(_) => {}
+        }
+    } else if has_image {
+        // Do not send a secondary text representation while an image is
+        // waiting for the lower-frequency image poll.
+        return None;
     }
     clipboard.get_text().ok().map(ClipboardSnapshot::Text)
 }
@@ -658,13 +730,34 @@ mod tests {
 
     #[test]
     fn file_offer_roundtrips_through_clipboard_envelope() {
-        let message = ClipboardMessage::Files {
+        let message = ClipboardMessage::Transfer {
             id: "alpha".into(),
             message: FileTransferMessage::Offer {
                 transfer_id: 7,
+                purpose: TransferPurpose::Files,
                 files: vec![files::FileMeta {
                     name: "report.txt".into(),
                     size: 42,
+                }],
+            },
+        };
+        let encoded = serde_json::to_vec(&message).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ClipboardMessage>(&encoded).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn image_offer_roundtrips_through_clipboard_envelope() {
+        let message = ClipboardMessage::Transfer {
+            id: "alpha".into(),
+            message: FileTransferMessage::Offer {
+                transfer_id: 8,
+                purpose: TransferPurpose::Image,
+                files: vec![files::FileMeta {
+                    name: "clipboard.png".into(),
+                    size: 1024,
                 }],
             },
         };
