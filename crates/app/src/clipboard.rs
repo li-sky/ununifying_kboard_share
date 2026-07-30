@@ -5,26 +5,34 @@
 //! text payloads can take time to encrypt; neither is allowed onto the
 //! latency-sensitive keyboard path.
 
+#[path = "clipboard_files.rs"]
+mod files;
+
 use anyhow::{anyhow, bail, Context, Result};
+use clipboard_rs::{Clipboard, ClipboardContext};
+use files::{FileTransferMessage, FileTransfers};
 use kbshare_net::registry::RegistryClient;
 use kbshare_net::session::{client_handshake, server_handshake};
 use kbshare_net::trust::{AutoTrustPolicy, TrustDecision, TrustStore};
 use rustls::{ClientConfig, ServerConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const CLIPBOARD_PROTOCOL_VERSION: u32 = 1;
+const CLIPBOARD_PROTOCOL_VERSION: u32 = 2;
 const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 // JSON may encode one control byte as a six-byte `\u00xx` escape.
 const MAX_FRAME_BYTES: usize = MAX_CLIPBOARD_BYTES * 6 + 4096;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
-const IO_TIMEOUT: Duration = Duration::from_millis(100);
+const IO_TIMEOUT: Duration = Duration::from_millis(20);
+const IDLE_SLEEP: Duration = Duration::from_millis(20);
+const RETAINED_FILE_TRANSFERS: usize = 3;
 
 #[derive(Clone)]
 pub struct ClipboardConfig {
@@ -59,6 +67,10 @@ enum ClipboardMessage {
         sequence: u64,
         text: String,
     },
+    Files {
+        id: String,
+        message: FileTransferMessage,
+    },
 }
 
 #[derive(Default)]
@@ -67,20 +79,50 @@ struct FrameDecoder {
 }
 
 struct ClipboardState {
-    clipboard: arboard::Clipboard,
-    last_observed: Option<String>,
+    clipboard: ClipboardContext,
+    last_observed: Option<ClipboardSnapshot>,
     sequence: u64,
+    transfers: FileTransfers,
+    received_directories: VecDeque<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClipboardSnapshot {
+    Text(String),
+    Files(Vec<PathBuf>),
 }
 
 impl ClipboardState {
-    fn open() -> Result<Self> {
-        let mut clipboard = arboard::Clipboard::new().context("open system clipboard")?;
-        let last_observed = clipboard.get_text().ok();
+    fn open(peer_id: &str) -> Result<Self> {
+        let clipboard =
+            ClipboardContext::new().map_err(|error| anyhow!("open system clipboard: {error}"))?;
+        let last_observed = observe_clipboard(&clipboard);
         Ok(Self {
             clipboard,
             last_observed,
             sequence: 0,
+            transfers: FileTransfers::new(peer_id),
+            received_directories: VecDeque::new(),
         })
+    }
+
+    fn retain_received_directory(&mut self, directory: PathBuf) {
+        self.received_directories.push_back(directory);
+        while self.received_directories.len() > RETAINED_FILE_TRANSFERS {
+            if let Some(old) = self.received_directories.pop_front() {
+                let _ = std::fs::remove_dir_all(old);
+            }
+        }
+    }
+
+    fn on_session_lost(&mut self) {
+        let was_sending_files = self.transfers.cancel_outbound("session lost").is_some();
+        self.transfers.cancel_inbound();
+        if was_sending_files {
+            // Re-observe and resend after reconnect. A partially transferred
+            // file set must start again with a fresh offer.
+            self.last_observed = None;
+        }
     }
 }
 
@@ -139,7 +181,7 @@ fn run(config: ClipboardConfig, shutdown: &Arc<AtomicBool>) -> Result<()> {
     let trust = TrustStore::load(config.trust_store.clone())?;
     // Keep one clipboard object alive across network reconnects. This matters
     // on X11/Wayland, where clipboard ownership can be tied to its lifetime.
-    let mut clipboard = ClipboardState::open()?;
+    let mut clipboard = ClipboardState::open(&config.remote_id)?;
     if config.local_id < config.remote_id {
         run_dialer(&config, &trust, &mut clipboard, shutdown)
     } else {
@@ -179,6 +221,7 @@ fn run_dialer(
                     shutdown,
                 )
             })();
+            clipboard.on_session_lost();
             if let Err(error) = result {
                 tracing::warn!(%address, error = %error, "clipboard TLS session ended");
             }
@@ -215,6 +258,7 @@ fn run_listener(
                         shutdown,
                     )
                 })();
+                clipboard.on_session_lost();
                 if let Err(error) = result {
                     tracing::warn!(%peer, error = %error, "clipboard TLS session ended");
                 }
@@ -248,6 +292,9 @@ fn run_session(
     let mut verified = false;
     let mut decoder = FrameDecoder::default();
     let mut buffer = [0_u8; 8192];
+    let mut last_poll = Instant::now()
+        .checked_sub(POLL_INTERVAL)
+        .unwrap_or_else(Instant::now);
 
     tracing::info!("clipboard TLS session connected");
     while !shutdown.load(Ordering::Relaxed) {
@@ -261,29 +308,7 @@ fn run_session(
                         verified = true;
                         continue;
                     }
-                    match message {
-                        ClipboardMessage::Text { id, text, .. } if id == config.remote_id => {
-                            if text.as_bytes().len() > MAX_CLIPBOARD_BYTES {
-                                bail!(
-                                    "received clipboard text exceeds {MAX_CLIPBOARD_BYTES} bytes"
-                                );
-                            }
-                            if clipboard.last_observed.as_deref() != Some(text.as_str()) {
-                                clipboard
-                                    .clipboard
-                                    .set_text(text.clone())
-                                    .context("write system clipboard")?;
-                                clipboard.last_observed = Some(text);
-                                tracing::info!("applied clipboard text received from peer");
-                            }
-                        }
-                        ClipboardMessage::Hello { .. } => {
-                            bail!("unexpected second clipboard Hello");
-                        }
-                        ClipboardMessage::Text { .. } => {
-                            bail!("clipboard message came from an unexpected peer");
-                        }
-                    }
+                    handle_incoming(&mut stream, config, clipboard, message)?;
                 }
             }
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
@@ -291,33 +316,221 @@ fn run_session(
         }
 
         if verified {
-            if let Ok(current) = clipboard.clipboard.get_text() {
-                if clipboard.last_observed.as_deref() != Some(current.as_str()) {
-                    if current.as_bytes().len() <= MAX_CLIPBOARD_BYTES {
-                        clipboard.sequence = clipboard.sequence.wrapping_add(1);
-                        send(
-                            &mut stream,
-                            &ClipboardMessage::Text {
-                                id: config.local_id.clone(),
-                                sequence: clipboard.sequence,
-                                text: current.clone(),
-                            },
-                        )?;
-                        tracing::info!(bytes = current.len(), "sent local clipboard text to peer");
-                    } else {
-                        tracing::warn!(
-                            bytes = current.len(),
-                            limit = MAX_CLIPBOARD_BYTES,
-                            "clipboard text is too large to share"
-                        );
+            if last_poll.elapsed() >= POLL_INTERVAL {
+                last_poll = Instant::now();
+                if let Some(current) = observe_clipboard(&clipboard.clipboard) {
+                    if clipboard.last_observed.as_ref() != Some(&current) {
+                        if let Some(cancel) =
+                            clipboard.transfers.cancel_outbound("clipboard changed")
+                        {
+                            send_file_message(&mut stream, config, cancel)?;
+                        }
+                        send_clipboard_change(&mut stream, config, clipboard, current)?;
                     }
-                    clipboard.last_observed = Some(current);
+                }
+            }
+
+            match clipboard.transfers.next_outbound() {
+                Ok(Some(message)) => {
+                    let completed = matches!(message, FileTransferMessage::Complete { .. });
+                    send_file_message(&mut stream, config, message)?;
+                    if completed {
+                        tracing::info!("clipboard file transfer sent; waiting for peer validation");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "clipboard file transfer aborted");
+                    if let Some(cancel) = clipboard
+                        .transfers
+                        .cancel_outbound("source file changed or became unavailable")
+                    {
+                        send_file_message(&mut stream, config, cancel)?;
+                    }
                 }
             }
         }
-        std::thread::sleep(POLL_INTERVAL);
+        if !clipboard.transfers.has_outbound() {
+            std::thread::sleep(IDLE_SLEEP);
+        }
     }
     Ok(())
+}
+
+fn handle_incoming(
+    stream: &mut Box<dyn ClipboardIo>,
+    config: &ClipboardConfig,
+    clipboard: &mut ClipboardState,
+    message: ClipboardMessage,
+) -> Result<()> {
+    match message {
+        ClipboardMessage::Text { id, text, .. } if id == config.remote_id => {
+            if text.len() > MAX_CLIPBOARD_BYTES {
+                bail!("received clipboard text exceeds {MAX_CLIPBOARD_BYTES} bytes");
+            }
+            clipboard.transfers.cancel_inbound();
+            let snapshot = ClipboardSnapshot::Text(text.clone());
+            if clipboard.last_observed.as_ref() != Some(&snapshot) {
+                clipboard
+                    .clipboard
+                    .set_text(text)
+                    .map_err(|error| anyhow!("write system clipboard: {error}"))?;
+                clipboard.last_observed = Some(snapshot);
+                tracing::info!("applied clipboard text received from peer");
+            }
+            Ok(())
+        }
+        ClipboardMessage::Files { id, message } if id == config.remote_id => {
+            let is_offer = matches!(&message, FileTransferMessage::Offer { .. });
+            let is_accepted = matches!(&message, FileTransferMessage::Accepted { .. });
+            match clipboard.transfers.receive(message) {
+                Ok(Some(received)) => {
+                    let transfer_id = received.transfer_id;
+                    let directory = received.directory;
+                    let paths = received.paths;
+                    let clipboard_paths = paths
+                        .iter()
+                        .map(|path| clipboard_file_value(path))
+                        .collect::<Vec<_>>();
+                    if let Err(error) = clipboard.clipboard.set_files(clipboard_paths) {
+                        let _ = std::fs::remove_dir_all(&directory);
+                        return Err(anyhow!("write received files to system clipboard: {error}"));
+                    }
+                    clipboard.last_observed = Some(ClipboardSnapshot::Files(paths.clone()));
+                    clipboard.retain_received_directory(directory);
+                    send_file_message(
+                        stream,
+                        config,
+                        FileTransferMessage::Accepted { transfer_id },
+                    )?;
+                    tracing::info!(
+                        files = paths.len(),
+                        "received clipboard files are ready to paste"
+                    );
+                }
+                Ok(None) => {
+                    if is_offer {
+                        tracing::info!("receiving clipboard files from peer");
+                    } else if is_accepted {
+                        tracing::info!("peer validated clipboard file transfer");
+                    }
+                }
+                Err(error) => {
+                    clipboard.transfers.cancel_inbound();
+                    return Err(error).context("receive clipboard files");
+                }
+            }
+            Ok(())
+        }
+        ClipboardMessage::Hello { .. } => bail!("unexpected second clipboard Hello"),
+        ClipboardMessage::Text { .. } | ClipboardMessage::Files { .. } => {
+            bail!("clipboard message came from an unexpected peer")
+        }
+    }
+}
+
+fn send_clipboard_change(
+    stream: &mut Box<dyn ClipboardIo>,
+    config: &ClipboardConfig,
+    clipboard: &mut ClipboardState,
+    current: ClipboardSnapshot,
+) -> Result<()> {
+    match &current {
+        ClipboardSnapshot::Text(text) => {
+            if text.len() <= MAX_CLIPBOARD_BYTES {
+                clipboard.sequence = clipboard.sequence.wrapping_add(1);
+                send(
+                    stream,
+                    &ClipboardMessage::Text {
+                        id: config.local_id.clone(),
+                        sequence: clipboard.sequence,
+                        text: text.clone(),
+                    },
+                )?;
+                tracing::info!(bytes = text.len(), "sent local clipboard text to peer");
+            } else {
+                tracing::warn!(
+                    bytes = text.len(),
+                    limit = MAX_CLIPBOARD_BYTES,
+                    "clipboard text is too large to share"
+                );
+            }
+        }
+        ClipboardSnapshot::Files(paths) => {
+            clipboard.sequence = clipboard.sequence.wrapping_add(1);
+            let transfer_id = new_transfer_id(clipboard.sequence);
+            match clipboard
+                .transfers
+                .begin_outbound(transfer_id, paths.clone())
+            {
+                Ok(offer) => {
+                    send_file_message(stream, config, offer)?;
+                    tracing::info!(
+                        files = paths.len(),
+                        transfer_id,
+                        "sending clipboard files to peer"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "clipboard files cannot be shared");
+                }
+            }
+        }
+    }
+    clipboard.last_observed = Some(current);
+    Ok(())
+}
+
+fn send_file_message(
+    stream: &mut Box<dyn ClipboardIo>,
+    config: &ClipboardConfig,
+    message: FileTransferMessage,
+) -> Result<()> {
+    send(
+        stream,
+        &ClipboardMessage::Files {
+            id: config.local_id.clone(),
+            message,
+        },
+    )
+}
+
+fn observe_clipboard(clipboard: &ClipboardContext) -> Option<ClipboardSnapshot> {
+    if let Ok(files) = clipboard.get_files() {
+        let paths = files
+            .iter()
+            .filter_map(|file| clipboard_file_path(file))
+            .collect::<Vec<_>>();
+        if !paths.is_empty() {
+            return Some(ClipboardSnapshot::Files(paths));
+        }
+    }
+    clipboard.get_text().ok().map(ClipboardSnapshot::Text)
+}
+
+fn clipboard_file_path(value: &str) -> Option<PathBuf> {
+    if value.starts_with("file://") {
+        return url::Url::parse(value).ok()?.to_file_path().ok();
+    }
+    Some(PathBuf::from(value))
+}
+
+fn clipboard_file_value(path: &Path) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(url) = url::Url::from_file_path(path) {
+            return url.to_string();
+        }
+    }
+    path.to_string_lossy().into_owned()
+}
+
+fn new_transfer_id(sequence: u64) -> u64 {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    time ^ sequence.rotate_left(17) ^ u64::from(std::process::id())
 }
 
 fn verify_hello(
@@ -441,5 +654,24 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&message).unwrap();
         assert!(!encoded.contains(&b'\n'));
+    }
+
+    #[test]
+    fn file_offer_roundtrips_through_clipboard_envelope() {
+        let message = ClipboardMessage::Files {
+            id: "alpha".into(),
+            message: FileTransferMessage::Offer {
+                transfer_id: 7,
+                files: vec![files::FileMeta {
+                    name: "report.txt".into(),
+                    size: 42,
+                }],
+            },
+        };
+        let encoded = serde_json::to_vec(&message).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ClipboardMessage>(&encoded).unwrap(),
+            message
+        );
     }
 }

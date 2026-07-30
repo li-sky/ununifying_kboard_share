@@ -36,7 +36,9 @@ tiny_http = "0.12"
 clap = { version = "4", features = ["derive"] }
 once_cell = "1"
 if-addrs = "0.15"
-arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+clipboard-rs = { version = "0.3.5", default-features = false, features = ["wayland"] }
+base64 = "0.22"
+url = "2"
 
 # Windows
 windows-sys = { version = "0.59", features = [

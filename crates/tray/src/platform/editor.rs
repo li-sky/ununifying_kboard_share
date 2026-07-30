@@ -830,7 +830,7 @@ const PAGE_V2: &str = r#"<!doctype html>
         <label class="wide">Registry endpoint<input id="registry_url" type="url" placeholder="https://registry.example.com"></label>
         <label>Listening TCP port<input id="tcp_port" type="number" min="1" max="65535"></label>
         <label>Clipboard TLS port<input id="clipboard_port" type="number" min="1" max="65535"></label>
-        <label class="wide check"><input id="clipboard_enabled" type="checkbox">Share text clipboard over an independent TLS connection</label>
+        <label class="wide check"><input id="clipboard_enabled" type="checkbox">Share text and files over an independent TLS connection</label>
         <label class="wide check"><input id="auto_trust_first_seen" type="checkbox">Trust a selected peer's certificate on its first connection (TOFU)</label>
       </div>
       <h3>Available machines</h3>
