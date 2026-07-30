@@ -2,6 +2,7 @@
 //! plus a tiny HTTP client for the IP registry.
 
 pub mod cert;
+pub mod local_addr;
 pub mod registry;
 pub mod session;
 pub mod tls;

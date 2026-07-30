@@ -24,6 +24,8 @@
 - A 机：`config.json`，`local_id` 填本机名称，`remote_id` 填对端名称，
   `fallback_remote_ips` 填对端 IP。
 - B 机：`config.json`，`local_id` 和 `remote_id` 互换。
+- 两端 `clipboard_enabled` 均设为 `true`，`clipboard_port` 使用相同且未占用的
+  端口（样例为 `5006`）；防火墙同时放行 `5005/tcp` 和 `5006/tcp`。
 
 `local_id < remote_id`（字典序）的一方负责拨号连接，另一方负责监听——
 这是内部建链规则，用户无需关心。
@@ -43,6 +45,9 @@
    - `peer fingerprint verified` 或 `auto-trusting first seen fingerprint`
 
 两端日志中应看到对应的 `peer verified`。
+
+剪贴板通道还应出现 `clipboard TLS listener ready` 和
+`clipboard TLS session connected`。它与键盘会话分别连接，短暂晚几秒属于正常。
 
 ## 步骤 2：触发远程模式
 
@@ -108,13 +113,21 @@ X11/XWayland 回退。纯 Wayland 下不能把读取全局坐标作为回退方�
   触发滚动或选择）。
 - 这是 `PressedKeys` 在断线时对对端做 release-all 的效果。
 
-## 步骤 5：Panic 恢复
+## 步骤 5：剪贴板与键盘隔离
+
+1. 两端先各自复制不同文本，再启动连接；连接建立时双方已有内容均不应被覆盖。
+2. 在 A 机复制包含换行和中文的文本，B 机粘贴应得到完全相同内容；反向重复。
+3. 复制接近 1 MiB 的文本，同时持续快速打字。键盘输入应保持原有延迟和顺序。
+4. 只阻断 `clipboard_port`（默认 `5006`）后继续打字：键盘转发必须正常，日志只应
+   报告剪贴板会话重连。恢复端口后再次复制，剪贴板应恢复同步。
+
+## 步骤 6：Panic 恢复
 
 此处留一个未接的 UI 线索：`HostDriver::on_panic_hotkey()` 已经实现并在单元
 测试里证明能 flush。下一步可以把“连按 5 次 Esc”之类的组合键识别接进
 capture 回调，调用 `on_panic_hotkey`。目前请用**杀进程**来模拟。
 
-## 步骤 6：本机鼠标抢回
+## 步骤 7：本机鼠标抢回
 
 1. 处于远程模式 + 正在打字。
 2. 在本机动一下本机鼠标。

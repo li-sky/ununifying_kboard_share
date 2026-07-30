@@ -2,6 +2,8 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod clipboard;
+
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use kbshare_core::codec::LineDecoder;
@@ -21,7 +23,7 @@ use kbshare_tray::{TrayConfig, TrayExit, MODE_LOCAL, MODE_REMOTE};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -43,6 +45,10 @@ struct Config {
     remote_id: String,
     #[serde(default = "default_tcp_port")]
     tcp_port: u16,
+    #[serde(default = "default_clipboard_enabled")]
+    clipboard_enabled: bool,
+    #[serde(default = "default_clipboard_port")]
+    clipboard_port: u16,
     #[serde(default = "default_cert")]
     cert_file: PathBuf,
     #[serde(default = "default_key")]
@@ -67,6 +73,12 @@ struct Config {
 
 fn default_tcp_port() -> u16 {
     5005
+}
+fn default_clipboard_enabled() -> bool {
+    true
+}
+fn default_clipboard_port() -> u16 {
+    5006
 }
 fn default_cert() -> PathBuf {
     PathBuf::from("certs/kbshare_cert.pem")
@@ -164,11 +176,11 @@ fn run(paths: RuntimePaths) -> Result<()> {
     let bundle = load_or_create_cert(&cfg.cert_file, &cfg.key_file, &cfg.local_id)?;
     let our_fp = fingerprint_hex(&bundle.cert_der);
     tracing::info!(id = %cfg.local_id, peer = %cfg.remote_id, fingerprint = %our_fp, "kbshare peer starting");
-    report_local_node(&cfg);
 
     let mode_flag = Arc::new(AtomicU8::new(MODE_LOCAL));
     let session_active = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
+    start_registry_reporter(cfg.clone(), shutdown.clone())?;
     let tray_cfg = TrayConfig {
         app_name: "kbshare".to_string(),
         local_id: cfg.local_id.clone(),
@@ -199,6 +211,29 @@ fn run(paths: RuntimePaths) -> Result<()> {
         .ensure_layout(&cfg.local_id, &cfg.remote_id, flow_role);
     let client_tls = build_client_config(&bundle)?;
     let server_tls = build_server_config(&bundle)?;
+    let trust_policy = if cfg.auto_trust_first_seen {
+        AutoTrustPolicy::TrustOnFirstUse
+    } else {
+        AutoTrustPolicy::RequireKnown
+    };
+    let clipboard = clipboard::start(
+        clipboard::ClipboardConfig {
+            enabled: cfg.clipboard_enabled,
+            local_id: cfg.local_id.clone(),
+            remote_id: cfg.remote_id.clone(),
+            keyboard_port: cfg.tcp_port,
+            port: cfg.clipboard_port,
+            fallback_remote_ips: cfg.fallback_remote_ips.clone(),
+            vps_base_url: cfg.vps_base_url.clone(),
+            reconnect_secs: cfg.reconnect_secs,
+            trust_store: cfg.trust_store.clone(),
+            trust_policy,
+            our_fingerprint: our_fp.clone(),
+            client_tls: client_tls.clone(),
+            server_tls: server_tls.clone(),
+        },
+        shutdown.clone(),
+    )?;
     let engine_shutdown = shutdown.clone();
     let engine_mode = mode_flag.clone();
     let engine_session = session_active.clone();
@@ -228,6 +263,11 @@ fn run(paths: RuntimePaths) -> Result<()> {
     let engine_result = engine
         .join()
         .map_err(|_| anyhow!("peer engine thread panicked"))?;
+    if let Some(clipboard) = clipboard {
+        clipboard
+            .join()
+            .map_err(|_| anyhow!("clipboard thread panicked"))?;
+    }
     match tray_exit {
         TrayExit::ReloadConfig(path) => {
             relaunch_with_config(&path)?;
@@ -747,7 +787,13 @@ fn report_local_node(cfg: &Config) {
     let Some(base) = &cfg.vps_base_url else {
         return;
     };
-    let ips = local_ip().into_iter().collect::<Vec<_>>();
+    let ips = match kbshare_net::local_addr::local_ipv4_addrs() {
+        Ok(ips) => ips.into_iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::warn!(error = %error, "could not inspect local interfaces for discovery report");
+            return;
+        }
+    };
     if ips.is_empty() {
         tracing::warn!("could not determine local IP for discovery report");
         return;
@@ -761,7 +807,24 @@ fn report_local_node(cfg: &Config) {
     };
     if let Err(error) = RegistryClient::new(base).report(&report) {
         tracing::warn!(error = %error, "cloud discovery report failed");
+    } else {
+        tracing::info!(?report.ips, "cloud discovery report updated");
     }
+}
+
+fn start_registry_reporter(cfg: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
+    if cfg.vps_base_url.is_none() {
+        return Ok(());
+    }
+    std::thread::Builder::new()
+        .name("registry-reporter".into())
+        .spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                report_local_node(&cfg);
+                sleep_or_stop(Duration::from_secs(30), &shutdown);
+            }
+        })?;
+    Ok(())
 }
 
 fn inspect_local_mouse(local_id: &str) -> Option<LocalMouseInfo> {
@@ -970,12 +1033,6 @@ fn upsert_layout_device(
         y: 500,
     });
     true
-}
-
-fn local_ip() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    Some(socket.local_addr().ok()?.ip().to_string())
 }
 
 fn prepare_tcp(tcp: &TcpStream) -> Result<()> {

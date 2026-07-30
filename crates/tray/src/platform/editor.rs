@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -206,10 +206,17 @@ fn serve(
                         .filter(|port| (1..=u16::MAX as u64).contains(port))
                         .context("tcp_port must be between 1 and 65535")?
                         as u16;
-                    let ip = local_ip().context("could not determine this machine's local IP")?;
+                    let ips = kbshare_net::local_addr::local_ipv4_addrs()
+                        .context("could not inspect this machine's network interfaces")?
+                        .into_iter()
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>();
+                    if ips.is_empty() {
+                        anyhow::bail!("could not determine this machine's local IP");
+                    }
                     let report = kbshare_net::registry::NodeReport {
                         node_id: local_id.to_string(),
-                        ips: vec![ip.clone()],
+                        ips: ips.clone(),
                         tcp_port: Some(tcp_port),
                         udp_port: None,
                         event: "online".into(),
@@ -221,7 +228,7 @@ fn serve(
                     Ok(serde_json::json!({
                         "ok": true,
                         "node_id": local_id,
-                        "ips": [ip],
+                        "ips": ips,
                         "tcp_port": tcp_port,
                     }))
                 })();
@@ -280,12 +287,6 @@ fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .with_context(|| format!("{key} is required"))
-}
-
-fn local_ip() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    Some(socket.local_addr().ok()?.ip().to_string())
 }
 
 fn hex_fingerprint(value: [u8; 16]) -> String {
@@ -411,6 +412,20 @@ fn save_config(path: &Path, body: &[u8]) -> Result<()> {
         .unwrap_or(5005);
     if port == 0 || port > u16::MAX as u64 {
         bail!("tcp_port must be between 1 and 65535");
+    }
+    let clipboard_enabled = value
+        .get("clipboard_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let clipboard_port = value
+        .get("clipboard_port")
+        .and_then(Value::as_u64)
+        .unwrap_or(5006);
+    if clipboard_port == 0 || clipboard_port > u16::MAX as u64 {
+        bail!("clipboard_port must be between 1 and 65535");
+    }
+    if clipboard_enabled && clipboard_port == port {
+        bail!("clipboard_port must differ from tcp_port");
     }
     validate_layout(&value)?;
 
@@ -814,6 +829,8 @@ const PAGE_V2: &str = r#"<!doctype html>
         <label>Selected peer<input id="remote_id" readonly placeholder="No peer selected"></label>
         <label class="wide">Registry endpoint<input id="registry_url" type="url" placeholder="https://registry.example.com"></label>
         <label>Listening TCP port<input id="tcp_port" type="number" min="1" max="65535"></label>
+        <label>Clipboard TLS port<input id="clipboard_port" type="number" min="1" max="65535"></label>
+        <label class="wide check"><input id="clipboard_enabled" type="checkbox">Share text clipboard over an independent TLS connection</label>
         <label class="wide check"><input id="auto_trust_first_seen" type="checkbox">Trust a selected peer's certificate on its first connection (TOFU)</label>
       </div>
       <h3>Available machines</h3>
@@ -853,7 +870,7 @@ const PAGE_V2: &str = r#"<!doctype html>
     const saveRoute="__SAVE_ROUTE__", inspectRoute="__INSPECT_ROUTE__", installUdevRoute="__INSTALL_UDEV_ROUTE__", certificateRoute="__CERTIFICATE_ROUTE__", registerRoute="__REGISTER_ROUTE__", nodesRoute="__NODES_ROUTE__", statusRoute="__STATUS_ROUTE__", isLinux=__IS_LINUX__;
     let cfg=__INITIAL_CONFIG__, wizardStep=0, certificateReady=false, connected=false, layoutDirty=false;
     const $=id=>document.getElementById(id);
-    function normalizeConfig(){cfg.remote_id??="";cfg.flow_lite??={};cfg.tcp_port??=5005;cfg.auto_trust_first_seen??=true;}
+    function normalizeConfig(){cfg.remote_id??="";cfg.flow_lite??={};cfg.tcp_port??=5005;cfg.clipboard_enabled??=true;cfg.clipboard_port??=5006;cfg.auto_trust_first_seen??=true;}
     normalizeConfig();
     function setStatus(message,error=false,ok=false){$("status").textContent=message;$("status").className=error?"error":ok?"ok":"";}
     function fingerprint(value){return Array.isArray(value)&&value.length?value.map(byte=>Number(byte).toString(16).padStart(2,"0")).join(""):"—";}
@@ -862,12 +879,12 @@ const PAGE_V2: &str = r#"<!doctype html>
       const canvas=$("layout_canvas"),devices=f.layout?.devices??[];canvas.innerHTML="";if(!devices.length){canvas.innerHTML='<div class="empty">No matched machines yet.</div>';return;}for(const device of devices){const node=document.createElement("button");node.type="button";node.className="layout-device";node.style.left=`${Math.max(0,Math.min(1000,device.x))/10}%`;node.style.top=`${Math.max(0,Math.min(1000,device.y))/10}%`;node.innerHTML=`<strong>${escapeHtml(device.label||device.id)}</strong><small>Channel ${Number(device.host_index)+1}</small>`;node.onpointerdown=event=>{node.setPointerCapture(event.pointerId);const rect=canvas.getBoundingClientRect();node.onpointermove=move=>{device.x=Math.round(Math.max(0,Math.min(1000,(move.clientX-rect.left)/rect.width*1000)));device.y=Math.round(Math.max(0,Math.min(1000,(move.clientY-rect.top)/rect.height*1000)));node.style.left=`${device.x/10}%`;node.style.top=`${device.y/10}%`;};node.onpointerup=()=>{node.onpointermove=null;node.onpointerup=null;const layout=f.layout;layout.version=Math.max(Date.now(),Number(layout.version||0)+1);layout.updated_by=cfg.local_id;layoutDirty=true;$("raw").value=JSON.stringify(cfg,null,2);setStatus("Layout changed; save and restart to apply.",false,true);};};canvas.append(node);}
     }
     function render(){
-      $("local_id").value=cfg.local_id??"";$("remote_id").value=cfg.remote_id??"";$("registry_url").value=cfg.vps_base_url??"";$("tcp_port").value=cfg.tcp_port??5005;$("auto_trust_first_seen").checked=!!cfg.auto_trust_first_seen;
+      $("local_id").value=cfg.local_id??"";$("remote_id").value=cfg.remote_id??"";$("registry_url").value=cfg.vps_base_url??"";$("tcp_port").value=cfg.tcp_port??5005;$("clipboard_port").value=cfg.clipboard_port??5006;$("clipboard_enabled").checked=cfg.clipboard_enabled!==false;$("auto_trust_first_seen").checked=!!cfg.auto_trust_first_seen;
       renderFlow();
       $("raw").value=JSON.stringify(cfg,null,2);renderConnection();
     }
     function escapeHtml(value){const node=document.createElement("span");node.textContent=value;return node.innerHTML;}
-    function collect(){cfg.local_id=$("local_id").value.trim();cfg.remote_id=$("remote_id").value.trim();cfg.tcp_port=Number($("tcp_port").value);cfg.auto_trust_first_seen=$("auto_trust_first_seen").checked;const registry=$("registry_url").value.trim();if(registry)cfg.vps_base_url=registry;else delete cfg.vps_base_url;$("raw").value=JSON.stringify(cfg,null,2);return cfg;}
+    function collect(){cfg.local_id=$("local_id").value.trim();cfg.remote_id=$("remote_id").value.trim();cfg.tcp_port=Number($("tcp_port").value);cfg.clipboard_port=Number($("clipboard_port").value);cfg.clipboard_enabled=$("clipboard_enabled").checked;cfg.auto_trust_first_seen=$("auto_trust_first_seen").checked;const registry=$("registry_url").value.trim();if(registry)cfg.vps_base_url=registry;else delete cfg.vps_base_url;$("raw").value=JSON.stringify(cfg,null,2);return cfg;}
     function renderConnection(){const peer=cfg.remote_id?.trim();$("connection_title").textContent=connected?`Connected to ${peer||"peer"}`:peer?`Configured for ${peer}`:"Registered · waiting for connection";$("connection_detail").textContent=peer?(connected?"Secure session active":"The app will resolve this peer through the registry."):"Choose a registered machine below.";$("connection_badge").textContent=connected?"Connected":peer?"Configured":"Waiting";}
     async function pollStatus(){try{const r=await fetch(statusRoute),out=await r.json();if(out.ok){connected=!!out.connected;if(out.flow_lite){const edited=layoutDirty?cfg.flow_lite?.layout:null;cfg.flow_lite=out.flow_lite;if(edited)cfg.flow_lite.layout=edited;}renderConnection();renderFlow();}}catch(_){}}
     async function save(data,button){if(!data.local_id)throw new Error("This machine must be registered first");button.disabled=true;setStatus("Saving…");try{const r=await fetch(saveRoute,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)}),out=await r.json();if(!r.ok||!out.ok)throw new Error(out.error||"Save failed");setStatus("Saved. Restarting application…",false,true);}catch(error){button.disabled=false;setStatus(error.message,true);throw error;}}
@@ -916,6 +933,7 @@ mod tests {
         assert!(page.contains("/token/status"));
         assert!(page.contains("Register this machine"));
         assert!(page.contains("Load config file"));
+        assert!(page.contains("clipboard_port"));
     }
 
     #[test]
@@ -952,6 +970,27 @@ mod tests {
         let path = std::env::temp_dir().join("kbshare-editor-invalid.json");
         let error = save_config(&path, br#"{"local_id":"","remote_id":"peer"}"#).unwrap_err();
         assert!(error.to_string().contains("local_id"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn save_rejects_clipboard_port_that_would_claim_keyboard_listener() {
+        let path = std::env::temp_dir().join(format!(
+            "kbshare-editor-port-conflict-{}.json",
+            std::process::id()
+        ));
+        let error = save_config(
+            &path,
+            br#"{
+                "local_id":"desktop",
+                "remote_id":"peer",
+                "tcp_port":5005,
+                "clipboard_enabled":true,
+                "clipboard_port":5005
+            }"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must differ"));
         assert!(!path.exists());
     }
 

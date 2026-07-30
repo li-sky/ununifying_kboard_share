@@ -24,5 +24,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 ureq = { workspace = true }
 tiny_http = { workspace = true }
+if-addrs = { workspace = true }
 
 [dev-dependencies]

@@ -2,6 +2,8 @@
   "local_id": "alpha",
   "remote_id": "beta",
   "tcp_port": 5005,
+  "clipboard_enabled": true,
+  "clipboard_port": 5006,
   "cert_file": "certs/kbshare_cert.pem",
   "key_file": "certs/kbshare_key.pem",
   "trust_store": "trust.json",

@@ -15,6 +15,8 @@
   - `tray` —— 可复用的系统托盘库与配置编辑器。
   - `flow` —— Logitech HID++ 探测与 Easy-Switch。
 - **协议**：NDJSON。每条消息是一行 JSON，方便日志、抓包、重放、测试。
+- **剪贴板**：文本剪贴板使用独立的 TLS 连接和工作线程，默认监听 `5006`；
+  大段文本、剪贴板 API 卡顿或剪贴板连接重连都不会占用键盘的 `5005` 通道。
 - **状态机**：`Local ↔ Remote`，纯函数 `transition(state, event) -> (state, action)`，100% 可单测。
 - **按键跟踪**：`PressedKeys` 维护“我们当前认为对端按下的键”，断线/切模式时统一 release，杜绝卡键。
 - **测试**：
@@ -73,11 +75,32 @@ cargo run -p kbshare -- --config runtime_beta/config.json
 
 真实键盘捕获与注入的双机验证步骤见 `docs/manual_test.md`。
 
+## 剪贴板共享
+
+剪贴板文本默认双向同步。两端都需要开放并配置相同的独立端口：
+
+```json
+{
+  "tcp_port": 5005,
+  "clipboard_enabled": true,
+  "clipboard_port": 5006
+}
+```
+
+连接建立时不会用一台机器的旧内容覆盖另一台；连接后任意一端发生的下一次
+文本复制会通过独立 TLS 会话发送到对端。单次文本上限为 1 MiB，图片和文件列表
+暂不共享。剪贴板会话复用节点证书和同一份 TOFU 信任库，但拥有独立的 socket、
+读写循环和系统剪贴板轮询线程，因此断开或传输大文本不会阻塞键盘输入。
+
+若不需要此功能，将 `clipboard_enabled` 设为 `false`。防火墙只需允许监听方的
+`tcp_port` 和 `clipboard_port`；云端注册表仍只负责发现 IP，不接触剪贴板内容。
+
 ## 云端发现（可选）
 
 如果两台机器不在同一局域网，或者 IP 经常变动，可以在 VPS 上部署
-`kbshare-registry` 作为发现服务。每台 kbshare 启动时把自己的 IP 报告给
-注册表，连接前从注册表查询对端 IP。
+`kbshare-registry` 作为发现服务。每台 kbshare 启动后会定期把可供对端直连
+的本机 IP 报告给注册表，连接前从注册表查询对端 IP。透明代理 TUN 使用的
+回环、链路本地和 RFC 2544 基准测试地址不会被上报。
 
 ### 编译
 
@@ -202,7 +225,7 @@ curl https://kbshare-registry.example.com/health
 或在配置编辑器的 **Connection** 页面填写 **Cloud discovery endpoint**。
 
 kbshare 启动时会：
-1. 向注册表 `POST /report` 报告本机 `node_id` 和 IP。
+1. 向注册表 `POST /report` 报告本机 `node_id` 和 IP，之后每 30 秒刷新。
 2. 连接前 `GET /node/<remote_id>` 查询对端 IP。
 3. 如果注册表不可达或对端未注册，回退到 `fallback_remote_ips`。
 

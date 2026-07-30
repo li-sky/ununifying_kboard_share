@@ -122,6 +122,19 @@ fn tls_tofu_then_end_to_end_keystroke() {
     for msg in &step.outgoing {
         send_message(&mut stream, msg).unwrap();
     }
+    // Complete the application-level hello exchange before sending key data
+    // or closing the socket. Otherwise the host can finish so quickly that
+    // the receiver's first write races with teardown and sees BrokenPipe.
+    let mut host_decoder = LineDecoder::new();
+    loop {
+        match recv_message(&mut stream, &mut host_decoder).unwrap() {
+            Some(Message::Hello { id, .. }) => {
+                assert_eq!(id, "client-it");
+                break;
+            }
+            Some(_) | None => continue,
+        }
+    }
 
     // Push the host into Remote by reporting peer mouse activity.
     h.on_incoming(Message::Heartbeat {
