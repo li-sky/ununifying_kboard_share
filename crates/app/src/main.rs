@@ -1036,6 +1036,9 @@ fn upsert_layout_device(
 }
 
 fn prepare_tcp(tcp: &TcpStream) -> Result<()> {
+    // Listener sockets are nonblocking, but established peer streams use
+    // blocking I/O with a short read timeout.
+    tcp.set_nonblocking(false)?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_millis(10)))?;
     Ok(())

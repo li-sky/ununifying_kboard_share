@@ -17,7 +17,7 @@ use kbshare_net::trust::{AutoTrustPolicy, TrustDecision, TrustStore};
 use rustls::{ClientConfig, ServerConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const IMAGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const IO_TIMEOUT: Duration = Duration::from_millis(20);
 const IDLE_SLEEP: Duration = Duration::from_millis(20);
+const WRITE_RETRY_SLEEP: Duration = Duration::from_millis(5);
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETAINED_FILE_TRANSFERS: usize = 3;
 
 #[derive(Clone)]
@@ -225,7 +227,7 @@ fn run_dialer(
             })();
             clipboard.on_session_lost();
             if let Err(error) = result {
-                tracing::warn!(%address, error = %error, "clipboard TLS session ended");
+                tracing::warn!(%address, error = %format!("{error:#}"), "clipboard TLS session ended");
             }
         }
         sleep_or_stop(Duration::from_secs(config.reconnect_secs.max(1)), shutdown);
@@ -262,7 +264,7 @@ fn run_listener(
                 })();
                 clipboard.on_session_lost();
                 if let Err(error) = result {
-                    tracing::warn!(%peer, error = %error, "clipboard TLS session ended");
+                    tracing::warn!(%peer, error = %format!("{error:#}"), "clipboard TLS session ended");
                 }
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -316,7 +318,7 @@ fn run_session(
                     handle_incoming(&mut stream, config, clipboard, message)?;
                 }
             }
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) if is_transient_socket_error(&error) => {}
             Err(error) => return Err(error).context("read clipboard TLS stream"),
         }
 
@@ -648,9 +650,63 @@ fn send(stream: &mut Box<dyn ClipboardIo>, message: &ClipboardMessage) -> Result
         bail!("clipboard frame exceeds {MAX_FRAME_BYTES} encoded bytes");
     }
     bytes.push(b'\n');
-    stream.write_all(&bytes)?;
-    stream.flush()?;
+    write_all_with_retry(stream.as_mut(), &bytes).context("write clipboard TLS frame")?;
     Ok(())
+}
+
+fn write_all_with_retry(stream: &mut dyn ClipboardIo, mut bytes: &[u8]) -> io::Result<()> {
+    let mut stalled_since = Instant::now();
+    while !bytes.is_empty() {
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::WriteZero,
+                    "clipboard TLS stream accepted no bytes",
+                ));
+            }
+            Ok(written) => {
+                bytes = &bytes[written..];
+                stalled_since = Instant::now();
+            }
+            Err(error) if is_transient_socket_error(&error) => {
+                retry_after_transient_write(&error, stalled_since)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    loop {
+        match stream.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if is_transient_socket_error(&error) => {
+                retry_after_transient_write(&error, stalled_since)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn retry_after_transient_write(error: &io::Error, stalled_since: Instant) -> io::Result<()> {
+    if stalled_since.elapsed() >= WRITE_STALL_TIMEOUT {
+        return Err(io::Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "clipboard TLS write made no progress for {} ms; last socket error: {error}",
+                WRITE_STALL_TIMEOUT.as_millis()
+            ),
+        ));
+    }
+    if error.kind() != ErrorKind::Interrupted {
+        std::thread::sleep(WRITE_RETRY_SLEEP);
+    }
+    Ok(())
+}
+
+fn is_transient_socket_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+    ) || error.raw_os_error() == Some(10035)
 }
 
 fn resolve_peer_addresses(config: &ClipboardConfig) -> Vec<String> {
@@ -675,6 +731,10 @@ fn resolve_peer_addresses(config: &ClipboardConfig) -> Vec<String> {
 }
 
 fn prepare_tcp(tcp: &TcpStream) -> Result<()> {
+    // The listener itself is nonblocking so the service can observe shutdown.
+    // Normalize accepted sockets before handing them to rustls; Winsock reports
+    // transient I/O on a nonblocking stream as WSAEWOULDBLOCK (10035).
+    tcp.set_nonblocking(false)?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(IO_TIMEOUT))?;
     tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -693,6 +753,43 @@ fn sleep_or_stop(total: Duration, shutdown: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FlakyClipboardIo {
+        bytes: Vec<u8>,
+        write_attempts: usize,
+        flush_attempts: usize,
+    }
+
+    impl Read for FlakyClipboardIo {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(ErrorKind::WouldBlock))
+        }
+    }
+
+    impl Write for FlakyClipboardIo {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.write_attempts += 1;
+            match self.write_attempts {
+                1 => Err(io::Error::from_raw_os_error(10035)),
+                3 => Err(io::Error::from(ErrorKind::WouldBlock)),
+                _ => {
+                    let written = bytes.len().min(3);
+                    self.bytes.extend_from_slice(&bytes[..written]);
+                    Ok(written)
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_attempts += 1;
+            if self.flush_attempts == 1 {
+                Err(io::Error::from_raw_os_error(10035))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     #[test]
     fn decoder_handles_fragmented_clipboard_text() {
@@ -726,6 +823,15 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&message).unwrap();
         assert!(!encoded.contains(&b'\n'));
+    }
+
+    #[test]
+    fn clipboard_writer_retries_windows_would_block_without_losing_bytes() {
+        let mut stream = FlakyClipboardIo::default();
+        write_all_with_retry(&mut stream, b"clipboard frame").unwrap();
+        assert_eq!(stream.bytes, b"clipboard frame");
+        assert!(stream.write_attempts > 3);
+        assert_eq!(stream.flush_attempts, 2);
     }
 
     #[test]
