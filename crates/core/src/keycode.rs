@@ -467,7 +467,12 @@ mod tests {
             let vk = 0x60 + i as u32;
             let k = from_win_vk(vk).expect("numpad digit must map");
             assert_eq!(k, Key(*want), "numpad digit vk {:#x}", vk);
-            assert_eq!(to_win_vk(k), Some(vk), "numpad digit vk {:#x} roundtrip", vk);
+            assert_eq!(
+                to_win_vk(k),
+                Some(vk),
+                "numpad digit vk {:#x} roundtrip",
+                vk
+            );
         }
     }
 
@@ -479,12 +484,17 @@ mod tests {
             (0x6B, codes::KEY_KPPLUS),     // VK_ADD
             (0x6D, codes::KEY_KPMINUS),    // VK_SUBTRACT
             (0x6E, codes::KEY_KPDOT),      // VK_DECIMAL
-            (0x6F, codes::KEY_KPSLASH),     // VK_DIVIDE
+            (0x6F, codes::KEY_KPSLASH),    // VK_DIVIDE
         ];
         for (vk, want) in cases {
             let k = from_win_vk(*vk).expect("numpad operator must map");
             assert_eq!(k, Key(*want), "numpad operator vk {:#x}", vk);
-            assert_eq!(to_win_vk(k), Some(*vk), "numpad operator vk {:#x} roundtrip", vk);
+            assert_eq!(
+                to_win_vk(k),
+                Some(*vk),
+                "numpad operator vk {:#x} roundtrip",
+                vk
+            );
         }
     }
 

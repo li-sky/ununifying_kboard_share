@@ -557,25 +557,33 @@ async fn run_wayland_input_portal(
 
     let mut active_capture: Option<ActiveCapture> = None;
     let mut shutdown_poll = tokio::time::interval(Duration::from_millis(100));
+    // Every exit path below must fall through to the cleanup after the loop:
+    // leaving a capture active keeps the compositor hiding the pointer.
+    let result: Result<()> = async {
     loop {
         tokio::select! {
             _ = shutdown_poll.tick() => {
                 if active_capture.is_some() && !hub.forwarding.load(Ordering::Relaxed) {
                     let active = active_capture.take().expect("active capture checked");
-                    portal
+                    if let Err(error) = portal
                         .release(&session, active.activation_id, active.release_position)
                         .await
-                        .context("release Wayland keyboard capture")?;
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "releasing Wayland keyboard capture failed; cycling the session"
+                        );
+                        let _ = portal.disable(&session).await;
+                        edges = configure_portal_barriers(&portal, &session).await?;
+                        portal
+                            .enable(&session)
+                            .await
+                            .context("re-enable Wayland input capture after a failed release")?;
+                    }
                 }
                 if hub.shutdown.load(Ordering::Relaxed)
                     || hub.engine_shutdown.load(Ordering::Relaxed)
                 {
-                    if let Some(active) = active_capture.take() {
-                        let _ = portal
-                            .release(&session, active.activation_id, active.release_position)
-                            .await;
-                    }
-                    let _ = portal.disable(&session).await;
                     return Ok(());
                 }
             }
@@ -637,9 +645,7 @@ async fn run_wayland_input_portal(
                         );
                         context.flush().context("bind EIS input capabilities")?;
                     }
-                    EiEvent::KeyboardKey(event)
-                        if hub.forwarding.load(Ordering::Relaxed) =>
-                    {
+                    EiEvent::KeyboardKey(event) => {
                         let Ok(code) = u16::try_from(event.key) else {
                             tracing::warn!(keycode = event.key, "ignoring oversized EIS keycode");
                             continue;
@@ -674,6 +680,16 @@ async fn run_wayland_input_portal(
             }
         }
     }
+    }
+    .await;
+
+    if let Some(active) = active_capture.take() {
+        let _ = portal
+            .release(&session, active.activation_id, active.release_position)
+            .await;
+    }
+    let _ = portal.disable(&session).await;
+    result
 }
 
 async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
@@ -683,6 +699,13 @@ async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
     }
 }
 
+/// Cancelling the portal future skips its release/disable cleanup, so give the
+/// loop (which polls the same flags) time to shut itself down first.
+async fn wait_for_shutdown_with_grace(shutdown: Arc<AtomicBool>) {
+    wait_for_shutdown(shutdown).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
 async fn run_wayland_input(
     hub: Arc<WaylandInputHub>,
     ready_tx: SyncSender<std::result::Result<(), String>>,
@@ -690,10 +713,10 @@ async fn run_wayland_input(
     let mut ready = Some(ready_tx);
     let result = tokio::select! {
         result = run_wayland_input_portal(hub.clone(), &mut ready) => result,
-        _ = wait_for_shutdown(hub.shutdown.clone()) => {
+        _ = wait_for_shutdown_with_grace(hub.shutdown.clone()) => {
             Err(anyhow!("Wayland InputCapture setup was cancelled"))
         }
-        _ = wait_for_shutdown(hub.engine_shutdown.clone()) => {
+        _ = wait_for_shutdown_with_grace(hub.engine_shutdown.clone()) => {
             Err(anyhow!("Wayland InputCapture setup was cancelled"))
         }
     };

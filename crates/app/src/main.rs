@@ -119,6 +119,9 @@ struct SessionCtx {
     outbound: HostDriver,
     inbound: ClientDriver,
     stream: SharedStream,
+    /// Set by the capture/heartbeat threads when a write fails, so the session
+    /// loop tears the link down instead of staying stuck in Remote mode.
+    link_down: Arc<AtomicBool>,
 }
 type SessionSlot = Arc<Mutex<Option<SessionCtx>>>;
 
@@ -127,6 +130,50 @@ struct LocalMouseInfo {
     fingerprint: Option<Vec<u8>>,
     current_host: u8,
     slot: Option<u8>,
+}
+
+#[derive(Debug, Default)]
+struct ExitHotkeyState {
+    modifiers: u8,
+}
+
+impl ExitHotkeyState {
+    const CTRL: u8 = 1 << 0;
+    const ALT: u8 = 1 << 1;
+    const SHIFT: u8 = 1 << 2;
+    const ALL_MODIFIERS: u8 = Self::CTRL | Self::ALT | Self::SHIFT;
+
+    fn observe(
+        &mut self,
+        action: kbshare_core::protocol::KeyAction,
+        key: kbshare_core::keycode::Key,
+    ) -> bool {
+        use kbshare_core::keycode::codes;
+
+        let modifier = match key.code() {
+            codes::KEY_LEFTCTRL | codes::KEY_RIGHTCTRL => Some(Self::CTRL),
+            codes::KEY_LEFTALT | codes::KEY_RIGHTALT => Some(Self::ALT),
+            codes::KEY_LEFTSHIFT | codes::KEY_RIGHTSHIFT => Some(Self::SHIFT),
+            _ => None,
+        };
+
+        match action {
+            kbshare_core::protocol::KeyAction::Press => {
+                if key.code() == codes::KEY_PAUSE {
+                    return self.modifiers == Self::ALL_MODIFIERS;
+                }
+                if let Some(modifier) = modifier {
+                    self.modifiers |= modifier;
+                }
+            }
+            kbshare_core::protocol::KeyAction::Release => {
+                if let Some(modifier) = modifier {
+                    self.modifiers &= !modifier;
+                }
+            }
+        }
+        false
+    }
 }
 
 fn main() -> Result<()> {
@@ -193,9 +240,37 @@ fn run(paths: RuntimePaths) -> Result<()> {
 
     if cfg.remote_id.trim().is_empty() {
         tracing::info!("local node is registered; waiting for a peer to be selected");
+        let exit_capture = match default_capture_with_shutdown(shutdown.clone()) {
+            Ok(mut capture) => {
+                let shutdown = shutdown.clone();
+                let mut exit_hotkey = ExitHotkeyState::default();
+                let mut exit_requested = false;
+                match capture.start(Box::new(move |action, key| {
+                    if exit_requested || shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if exit_hotkey.observe(action, key) {
+                        exit_requested = true;
+                        shutdown.store(true, Ordering::Relaxed);
+                        tracing::info!("exit hotkey pressed: Ctrl+Alt+Shift+Pause");
+                    }
+                })) {
+                    Ok(()) => Some(capture),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "exit hotkey capture unavailable");
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "exit hotkey capture unavailable");
+                None
+            }
+        };
         let tray_exit =
             kbshare_tray::run_tray(tray_cfg, mode_flag, session_active, shutdown.clone())?;
         shutdown.store(true, Ordering::Relaxed);
+        drop(exit_capture);
         return match tray_exit {
             TrayExit::ReloadConfig(path) => relaunch_with_config(&path),
             TrayExit::Quit => Ok(()),
@@ -305,12 +380,25 @@ fn run_engine(
     let forwarding = capture.forwarding_flag();
     {
         let slot = slot.clone();
+        let shutdown = shutdown.clone();
+        let mut exit_hotkey = ExitHotkeyState::default();
+        let mut exit_requested = false;
         capture.start(Box::new(move |action, key| {
+            if exit_requested || shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            if exit_hotkey.observe(action, key) {
+                exit_requested = true;
+                shutdown.store(true, Ordering::Relaxed);
+                tracing::info!("exit hotkey pressed: Ctrl+Alt+Shift+Pause");
+                return;
+            }
             let mut guard = slot.lock();
             if let Some(ctx) = guard.as_mut() {
                 let step = ctx.outbound.on_local_key(action, key);
                 if let Err(error) = send_host_step(&ctx.stream, &step) {
                     tracing::warn!(error = %error, "send key failed");
+                    ctx.link_down.store(true, Ordering::Relaxed);
                 }
             }
         }))?;
@@ -356,7 +444,10 @@ fn run_engine(
                         mouse_tick.store(false, Ordering::Relaxed);
                         let step = ctx.outbound.on_flow_departure();
                         apply_host_effects(&step, &forwarding, &mode_flag);
-                        let _ = send_host_step(&ctx.stream, &step);
+                        if let Err(error) = send_host_step(&ctx.stream, &step) {
+                            tracing::warn!(error = %error, "send flow departure failed");
+                            ctx.link_down.store(true, Ordering::Relaxed);
+                        }
                     }
                     Err(error) => tracing::warn!(error = %error, "Flow-lite switch failed"),
                 }
@@ -365,10 +456,14 @@ fn run_engine(
 
             let host_step = ctx.outbound.on_local_mouse();
             apply_host_effects(&host_step, &forwarding, &mode_flag);
-            let _ = send_host_step(&ctx.stream, &host_step);
+            if send_host_step(&ctx.stream, &host_step).is_err() {
+                ctx.link_down.store(true, Ordering::Relaxed);
+            }
             if !mouse_tick.swap(true, Ordering::Relaxed) {
                 let client_step = ctx.inbound.on_local_mouse_active();
-                let _ = apply_client_step(&ctx.stream, &injector, &client_step);
+                if apply_client_step(&ctx.stream, &injector, &client_step).is_err() {
+                    ctx.link_down.store(true, Ordering::Relaxed);
+                }
             }
         }))?;
     }
@@ -393,7 +488,10 @@ fn run_engine(
                         } else {
                             ctx.inbound.on_local_mouse_idle()
                         };
-                        let _ = apply_client_step(&ctx.stream, &injector, &step);
+                        if let Err(error) = apply_client_step(&ctx.stream, &injector, &step) {
+                            tracing::warn!(error = %error, "heartbeat send failed");
+                            ctx.link_down.store(true, Ordering::Relaxed);
+                        }
                     }
                 }
             })?;
@@ -596,18 +694,30 @@ fn run_session(
             layout: flow.lock().layout.clone(),
         },
     )?;
+    let link_down = Arc::new(AtomicBool::new(false));
     *slot.lock() = Some(SessionCtx {
         outbound,
         inbound,
         stream: stream.clone(),
+        link_down: link_down.clone(),
     });
     session_active.store(true, Ordering::Relaxed);
+
+    // The peer sends a heartbeat every `heartbeat_secs`; if several in a row go
+    // missing the link is dead (half-open TCP, suspended peer, Wi-Fi drop) and
+    // we must not stay in Remote mode with the local input still captured.
+    let heartbeat = Duration::from_secs_f32(cfg.heartbeat_secs.max(0.05));
+    let peer_timeout = (heartbeat * 5).max(Duration::from_secs(3));
+    let mut last_rx = Instant::now();
 
     let mut verified = false;
     let mut decoder = LineDecoder::new();
     let result = loop {
         if shutdown.load(Ordering::Relaxed) {
             break Ok(());
+        }
+        if link_down.load(Ordering::Relaxed) {
+            break Err(anyhow!("peer link failed while sending"));
         }
         let incoming = {
             let mut reader = stream.lock();
@@ -618,6 +728,12 @@ fn run_session(
             }
         };
         let Some(message) = incoming else {
+            if last_rx.elapsed() >= peer_timeout {
+                break Err(anyhow!(
+                    "peer link timed out after {:.1}s without traffic",
+                    last_rx.elapsed().as_secs_f32()
+                ));
+            }
             if verified
                 && !flow.lock().enabled
                 && last_mouse_inspect.elapsed() >= Duration::from_secs(5)
@@ -647,6 +763,7 @@ fn run_session(
             }
             continue;
         };
+        last_rx = Instant::now();
         if !verified {
             let Message::Hello {
                 id,
@@ -1267,6 +1384,37 @@ mod tests {
         }))
         .unwrap();
         assert!(config.auto_trust_first_seen);
+    }
+
+    #[test]
+    fn exit_hotkey_requires_ctrl_alt_shift_before_pause() {
+        use kbshare_core::keycode::{codes, Key};
+        use kbshare_core::protocol::KeyAction;
+
+        let mut hotkey = ExitHotkeyState::default();
+        assert!(!hotkey.observe(KeyAction::Press, Key::new(codes::KEY_PAUSE)));
+        assert!(!hotkey.observe(KeyAction::Press, Key::new(codes::KEY_LEFTCTRL)));
+        assert!(!hotkey.observe(KeyAction::Press, Key::new(codes::KEY_LEFTALT)));
+        assert!(!hotkey.observe(KeyAction::Press, Key::new(codes::KEY_LEFTSHIFT)));
+        assert!(hotkey.observe(KeyAction::Press, Key::new(codes::KEY_PAUSE)));
+    }
+
+    #[test]
+    fn exit_hotkey_accepts_right_hand_modifiers_and_resets_on_release() {
+        use kbshare_core::keycode::{codes, Key};
+        use kbshare_core::protocol::KeyAction;
+
+        let mut hotkey = ExitHotkeyState::default();
+        for code in [
+            codes::KEY_RIGHTCTRL,
+            codes::KEY_RIGHTALT,
+            codes::KEY_RIGHTSHIFT,
+        ] {
+            assert!(!hotkey.observe(KeyAction::Press, Key::new(code)));
+        }
+        assert!(hotkey.observe(KeyAction::Press, Key::new(codes::KEY_PAUSE)));
+        assert!(!hotkey.observe(KeyAction::Release, Key::new(codes::KEY_RIGHTALT)));
+        assert!(!hotkey.observe(KeyAction::Press, Key::new(codes::KEY_PAUSE)));
     }
 
     #[test]
