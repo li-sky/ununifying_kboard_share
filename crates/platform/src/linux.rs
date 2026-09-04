@@ -43,6 +43,9 @@ type SharedMouseCallback = Arc<Mutex<Box<dyn FnMut(MouseActivity) + Send>>>;
 
 struct WaylandInputHub {
     forwarding: Arc<AtomicBool>,
+    /// When evdev grabs the keyboard we never hold the portal capture, because
+    /// an active capture makes the compositor hide the local pointer.
+    keyboard_via_evdev: AtomicBool,
     key_callback: Mutex<Option<SharedKeyCallback>>,
     mouse_callback: Mutex<Option<SharedMouseCallback>>,
     shutdown: Arc<AtomicBool>,
@@ -57,6 +60,7 @@ impl WaylandInputHub {
     fn new(engine_shutdown: Arc<AtomicBool>) -> Arc<Self> {
         Arc::new(Self {
             forwarding: Arc::new(AtomicBool::new(false)),
+            keyboard_via_evdev: AtomicBool::new(false),
             key_callback: Mutex::new(None),
             mouse_callback: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -102,6 +106,11 @@ impl WaylandInputHub {
         if let Some(handle) = self.handle.lock().take() {
             let _ = handle.join();
         }
+    }
+
+    /// Whether an activated barrier must keep the compositor-side capture.
+    fn should_hold_capture(&self) -> bool {
+        self.forwarding.load(Ordering::Relaxed) && !self.keyboard_via_evdev.load(Ordering::Relaxed)
     }
 }
 
@@ -205,35 +214,37 @@ fn key_action(value: i32) -> Option<KeyAction> {
 impl KeyCapture for LinuxKeyCapture {
     fn start(&mut self, on_event: Box<dyn FnMut(KeyAction, Key) + Send>) -> Result<()> {
         let on_event = Arc::new(Mutex::new(on_event));
-        let mut portal_error = None;
-        if let Some(portal) = &self.portal {
+        if self.devices.is_empty() {
+            let Some(portal) = &self.portal else {
+                return Err(anyhow!(
+                    "no keyboard devices found; ensure the user has read access to /dev/input/event*"
+                ));
+            };
             *portal.key_callback.lock() = Some(on_event.clone());
-            match portal.ensure_started() {
-                Ok(()) => return Ok(()),
+            return match portal.ensure_started() {
+                Ok(()) => Ok(()),
                 Err(error) => {
+                    *portal.key_callback.lock() = None;
                     if self.engine_shutdown.load(Ordering::Relaxed) {
                         return Err(error);
                     }
-                    tracing::warn!(
-                        error = %error,
-                        "Wayland keyboard capture unavailable; trying evdev fallback"
-                    );
-                    portal_error = Some(error);
-                    *portal.key_callback.lock() = None;
+                    Err(anyhow!(
+                        "no Linux keyboard capture backend is available; \
+                         Wayland InputCapture/libei: {error:#}; \
+                         evdev: no readable keyboard in /dev/input/event*"
+                    ))
                 }
-            }
+            };
         }
-        if self.devices.is_empty() {
-            return Err(match portal_error {
-                Some(error) => anyhow!(
-                    "no Linux keyboard capture backend is available; \
-                     Wayland InputCapture/libei: {error:#}; \
-                     evdev fallback: no readable keyboard in /dev/input/event*"
-                ),
-                None => anyhow!(
-                    "no keyboard devices found; ensure the user has read access to /dev/input/event*"
-                ),
-            });
+        if let Some(portal) = &self.portal {
+            // evdev grabs the keyboard, so the portal is only an edge detector
+            // and never keeps a capture that would hide the local pointer.
+            portal.keyboard_via_evdev.store(true, Ordering::Relaxed);
+            *portal.key_callback.lock() = None;
+            tracing::info!(
+                keyboards = self.devices.len(),
+                "using evdev keyboard capture; the Wayland portal only detects edge crossings"
+            );
         }
         let shutdown = self.shutdown.clone();
         let forwarding = self.forwarding.clone();
@@ -563,7 +574,7 @@ async fn run_wayland_input_portal(
     loop {
         tokio::select! {
             _ = shutdown_poll.tick() => {
-                if active_capture.is_some() && !hub.forwarding.load(Ordering::Relaxed) {
+                if active_capture.is_some() && !hub.should_hold_capture() {
                     let active = active_capture.take().expect("active capture checked");
                     if let Err(error) = portal
                         .release(&session, active.activation_id, active.release_position)
@@ -603,7 +614,7 @@ async fn run_wayland_input_portal(
                         activation_id: activated.activation_id(),
                         release_position: edge.release_position(activated.cursor_position()),
                     };
-                    if hub.forwarding.load(Ordering::Relaxed) {
+                    if hub.should_hold_capture() {
                         active_capture = Some(active);
                     } else {
                         portal
