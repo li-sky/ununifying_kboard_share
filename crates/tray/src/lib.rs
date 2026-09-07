@@ -17,6 +17,21 @@ use std::sync::Arc;
 pub const MODE_LOCAL: u8 = 0;
 pub const MODE_REMOTE: u8 = 1;
 
+pub const CLIPBOARD_DISABLED: u8 = 0;
+pub const CLIPBOARD_DISCONNECTED: u8 = 1;
+pub const CLIPBOARD_READY: u8 = 2;
+pub const CLIPBOARD_TRANSFERRING: u8 = 3;
+pub const CLIPBOARD_FAILED: u8 = 4;
+pub fn clipboard_label(status: u8) -> &'static str {
+    match status {
+        CLIPBOARD_DISABLED => "Clipboard: disabled",
+        CLIPBOARD_READY => "Clipboard: ready",
+        CLIPBOARD_TRANSFERRING => "Clipboard: transferring",
+        CLIPBOARD_FAILED => "Clipboard: failed (see logs)",
+        _ => "Clipboard: disconnected",
+    }
+}
+
 #[path = "platform/editor.rs"]
 mod editor;
 pub use editor::{launch as launch_config_editor, EditorEvent as ConfigEditorEvent};
@@ -43,6 +58,7 @@ pub struct TrayConfig {
     pub log_dir: Option<PathBuf>,
     /// The node is registered but no peer has been selected yet.
     pub waiting_for_peer: bool,
+    pub clipboard_status: Arc<AtomicU8>,
 }
 
 #[cfg(windows)]
@@ -186,6 +202,11 @@ mod platform {
             false,
             None,
         );
+        let clipboard_item = MenuItem::new(
+            clipboard_label(cfg.clipboard_status.load(Ordering::Relaxed)),
+            false,
+            None,
+        );
         let id_item = MenuItem::new(format!("id: {}", cfg.local_id), false, None);
         let fp_item = MenuItem::new("Show fingerprint…", true, None);
         let log_item = MenuItem::new("Open log folder", log_dir.is_some(), None);
@@ -194,6 +215,7 @@ mod platform {
         let cfg_item = MenuItem::new("Open config folder", config_dir.is_some(), None);
         let quit_item = MenuItem::new("Quit", true, None);
         menu.append(&status_item)?;
+        menu.append(&clipboard_item)?;
         menu.append(&id_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&fp_item)?;
@@ -218,6 +240,8 @@ mod platform {
             .build()?;
 
         let menu_channel = MenuEvent::receiver();
+        let clipboard_status = cfg.clipboard_status.clone();
+        let mut shown_clipboard = u8::MAX;
         let mut shown_mode: u8 = MODE_LOCAL;
         let app_name = cfg.app_name.clone();
         let fingerprint = cfg.fingerprint.clone();
@@ -315,6 +339,11 @@ mod platform {
                 }
             }
 
+            let clipboard = clipboard_status.load(Ordering::Relaxed);
+            if clipboard != shown_clipboard {
+                shown_clipboard = clipboard;
+                clipboard_item.set_text(clipboard_label(clipboard));
+            }
             // Poll mode (cheap atomic) and update UI on change.
             let m = mode.load(Ordering::Relaxed);
             if m != shown_mode {
@@ -432,6 +461,13 @@ mod platform {
                 }
                 .into(),
                 StandardItem {
+                    label: clipboard_label(self.cfg.clipboard_status.load(Ordering::Relaxed))
+                        .into(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
                     label: format!("id: {}", self.cfg.local_id),
                     enabled: false,
                     ..Default::default()
@@ -529,6 +565,7 @@ mod platform {
             })?;
 
         tracing::info!("Linux status notifier started");
+        let mut shown_clipboard = u8::MAX;
         let mut shown_mode = initial_mode;
         let mut exit_action = TrayExit::Quit;
         let mut editor_events = None;
@@ -609,7 +646,9 @@ mod platform {
             }
 
             let current_mode = mode.load(Ordering::Relaxed);
-            if current_mode != shown_mode {
+            let current_clipboard = cfg.clipboard_status.load(Ordering::Relaxed);
+            if current_mode != shown_mode || current_clipboard != shown_clipboard {
+                shown_clipboard = current_clipboard;
                 shown_mode = current_mode;
                 handle.update(|tray| tray.mode = current_mode);
             }
@@ -639,6 +678,7 @@ mod platform {
                     config_dir: Some(PathBuf::from(".")),
                     log_dir: Some(PathBuf::from("logs")),
                     waiting_for_peer: false,
+                    clipboard_status: Arc::new(AtomicU8::new(CLIPBOARD_READY)),
                 },
                 mode: MODE_LOCAL,
                 actions,

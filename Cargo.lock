@@ -1416,6 +1416,7 @@ dependencies = [
  "base64",
  "clap 4.6.1",
  "clipboard-rs",
+ "crossbeam-channel",
  "hex",
  "kbshare-core",
  "kbshare-flow",

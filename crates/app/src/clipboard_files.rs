@@ -5,15 +5,16 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const MAX_FILES: usize = 32;
 pub const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
-const FILE_CHUNK_BYTES: usize = 128 * 1024;
+pub const FILE_CHUNK_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,10 +60,47 @@ pub enum FileTransferMessage {
     },
 }
 
+impl FileTransferMessage {
+    pub fn transfer_id(&self) -> u64 {
+        match self {
+            Self::Offer { transfer_id, .. }
+            | Self::Chunk { transfer_id, .. }
+            | Self::FileEnd { transfer_id, .. }
+            | Self::Complete { transfer_id }
+            | Self::Accepted { transfer_id }
+            | Self::Cancel { transfer_id, .. } => *transfer_id,
+        }
+    }
+}
+
+fn create_private_root(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn retire(ids: &mut VecDeque<u64>, id: u64) {
+    if !ids.contains(&id) {
+        ids.push_back(id);
+    }
+    while ids.len() > 256 {
+        ids.pop_front();
+    }
+}
+
 pub struct FileTransfers {
     root: PathBuf,
     outbound: Option<OutboundTransfer>,
     inbound: Option<InboundTransfer>,
+    retired_inbound: VecDeque<u64>,
+    retired_outbound: VecDeque<u64>,
+    last_inbound_progress: Instant,
+    last_outbound_progress: Instant,
 }
 
 impl Drop for FileTransfers {
@@ -90,6 +128,10 @@ impl FileTransfers {
                 .join(portable_name(peer_id)),
             outbound: None,
             inbound: None,
+            retired_inbound: VecDeque::new(),
+            retired_outbound: VecDeque::new(),
+            last_inbound_progress: Instant::now(),
+            last_outbound_progress: Instant::now(),
         }
     }
 
@@ -97,21 +139,45 @@ impl FileTransfers {
         self.outbound.is_some()
     }
 
-    pub fn cancel_outbound(&mut self, reason: &str) -> Option<FileTransferMessage> {
+    pub fn is_sending(&self) -> bool {
         self.outbound
-            .take()
-            .map(|transfer| FileTransferMessage::Cancel {
-                transfer_id: transfer.id,
-                reason: reason.to_string(),
-            })
+            .as_ref()
+            .is_some_and(|transfer| !transfer.complete_sent)
+    }
+
+    pub fn outbound_id(&self) -> Option<u64> {
+        self.outbound.as_ref().map(|t| t.id)
+    }
+    pub fn inbound_id(&self) -> Option<u64> {
+        self.inbound.as_ref().map(|t| t.id)
+    }
+
+    pub fn cancel_outbound(&mut self, reason: &str) -> Option<FileTransferMessage> {
+        let transfer = self.outbound.take()?;
+        retire(&mut self.retired_outbound, transfer.id);
+        Some(FileTransferMessage::Cancel {
+            transfer_id: transfer.id,
+            reason: reason.into(),
+        })
     }
 
     pub fn cancel_inbound(&mut self) {
         if let Some(transfer) = self.inbound.take() {
+            retire(&mut self.retired_inbound, transfer.id);
             let directory = transfer.directory.clone();
             drop(transfer);
             let _ = std::fs::remove_dir_all(directory);
         }
+    }
+
+    pub fn reject_inbound(&mut self, id: u64) {
+        retire(&mut self.retired_inbound, id);
+    }
+
+    pub fn expired(&self, now: Instant, timeout: Duration) -> bool {
+        (self.inbound.is_some() && now.duration_since(self.last_inbound_progress) >= timeout)
+            || (self.outbound.is_some()
+                && now.duration_since(self.last_outbound_progress) >= timeout)
     }
 
     pub fn begin_outbound(
@@ -134,7 +200,7 @@ impl FileTransfers {
             bail!("clipboard image exceeds the {} byte limit", MAX_IMAGE_BYTES);
         }
 
-        std::fs::create_dir_all(&self.root)
+        create_private_root(&self.root)
             .with_context(|| format!("create clipboard root {}", self.root.display()))?;
         let directory = self.root.join(format!("outbound-{transfer_id:016x}"));
         std::fs::create_dir(&directory)
@@ -172,6 +238,8 @@ impl FileTransfers {
             purpose,
             files: transfer.files.clone(),
         };
+        self.cancel_outbound("superseded");
+        self.last_outbound_progress = Instant::now();
         self.outbound = Some(transfer);
         Ok(offer)
     }
@@ -180,7 +248,11 @@ impl FileTransfers {
         let Some(transfer) = self.outbound.as_mut() else {
             return Ok(None);
         };
-        transfer.next_message()
+        let message = transfer.next_message()?;
+        if message.is_some() {
+            self.last_outbound_progress = Instant::now();
+        }
+        Ok(message)
     }
 
     pub fn receive(&mut self, message: FileTransferMessage) -> Result<Option<ReceivedFiles>> {
@@ -190,7 +262,11 @@ impl FileTransfers {
                 purpose,
                 files,
             } => {
+                if self.retired_inbound.contains(&transfer_id) {
+                    return Ok(None);
+                }
                 self.cancel_inbound();
+                self.last_inbound_progress = Instant::now();
                 self.inbound = Some(InboundTransfer::create(
                     &self.root,
                     transfer_id,
@@ -212,11 +288,14 @@ impl FileTransfers {
                     .as_ref()
                     .is_some_and(|transfer| transfer.id == transfer_id)
                 {
-                    self.outbound = None;
+                    self.cancel_outbound("peer cancelled");
                 }
                 Ok(None)
             }
             FileTransferMessage::Accepted { transfer_id } => {
+                if self.retired_outbound.contains(&transfer_id) {
+                    return Ok(None);
+                }
                 let transfer = self
                     .outbound
                     .as_ref()
@@ -224,17 +303,23 @@ impl FileTransfers {
                 if transfer.id != transfer_id || !transfer.complete_sent {
                     bail!("file acceptance does not match the completed outbound transfer");
                 }
+                retire(&mut self.retired_outbound, transfer_id);
                 self.outbound = None;
                 Ok(None)
             }
             message => {
+                if self.retired_inbound.contains(&message.transfer_id()) {
+                    return Ok(None);
+                }
                 let transfer = self
                     .inbound
                     .as_mut()
                     .context("received file data without an active offer")?;
                 let complete = transfer.receive(message)?;
+                self.last_inbound_progress = Instant::now();
                 if complete {
                     let transfer = self.inbound.take().expect("inbound transfer exists");
+                    retire(&mut self.retired_inbound, transfer.id);
                     Ok(Some(ReceivedFiles {
                         transfer_id: transfer.id,
                         purpose: transfer.purpose,
@@ -260,6 +345,7 @@ struct OutboundTransfer {
     id: u64,
     files: Vec<FileMeta>,
     paths: Vec<PathBuf>,
+    modified: Vec<Option<std::time::SystemTime>>,
     cleanup_directory: Option<PathBuf>,
     file_index: usize,
     open_file: Option<File>,
@@ -270,6 +356,7 @@ struct OutboundTransfer {
 
 impl Drop for OutboundTransfer {
     fn drop(&mut self) {
+        self.open_file.take();
         if let Some(directory) = self.cleanup_directory.take() {
             let _ = std::fs::remove_dir_all(directory);
         }
@@ -288,6 +375,7 @@ impl OutboundTransfer {
         let mut names = HashSet::new();
         let mut files = Vec::with_capacity(paths.len());
         let mut normalized = Vec::with_capacity(paths.len());
+        let mut modified = Vec::new();
         let mut total = 0_u64;
         for path in paths {
             let path = path
@@ -317,6 +405,7 @@ impl OutboundTransfer {
                 name,
                 size: metadata.len(),
             });
+            modified.push(metadata.modified().ok());
             normalized.push(path);
         }
 
@@ -324,6 +413,7 @@ impl OutboundTransfer {
             id,
             files,
             paths: normalized,
+            modified,
             cleanup_directory,
             file_index: 0,
             open_file: None,
@@ -343,6 +433,12 @@ impl OutboundTransfer {
                     transfer_id: self.id,
                 }))
             };
+        }
+        let metadata = self.paths[self.file_index].metadata()?;
+        if metadata.len() != self.files[self.file_index].size
+            || metadata.modified().ok() != self.modified[self.file_index]
+        {
+            bail!("clipboard file changed while it was being transferred");
         }
         if self.open_file.is_none() {
             self.open_file = Some(
@@ -414,7 +510,7 @@ impl InboundTransfer {
         files: Vec<FileMeta>,
     ) -> Result<Self> {
         validate_manifest(purpose, &files)?;
-        std::fs::create_dir_all(root)
+        create_private_root(root)
             .with_context(|| format!("create clipboard root {}", root.display()))?;
         let directory = root.join(format!("{id:016x}"));
         std::fs::create_dir(&directory)
@@ -553,7 +649,7 @@ fn validate_manifest(purpose: TransferPurpose, files: &[FileMeta]) -> Result<()>
         if file.name != portable_name(&file.name)
             || file.name == "."
             || file.name == ".."
-            || !names.insert(file.name.clone())
+            || !names.insert(file.name.to_lowercase())
         {
             bail!("unsafe or duplicate clipboard file name");
         }
@@ -586,11 +682,22 @@ fn portable_name(name: &str) -> String {
     let trimmed = name.trim().trim_end_matches('.').trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
         "file".to_string()
-    } else if is_windows_reserved_name(trimmed) {
-        format!("_{trimmed}")
     } else {
-        trimmed.to_string()
+        let bounded = truncate_utf8(trimmed, 200).trim_end_matches([' ', '.']);
+        if is_windows_reserved_name(bounded) {
+            format!("_{}", truncate_utf8(bounded, 199))
+        } else {
+            bounded.to_string()
+        }
     }
+}
+
+fn truncate_utf8(value: &str, limit: usize) -> &str {
+    let mut end = value.len().min(limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn is_windows_reserved_name(name: &str) -> bool {
@@ -606,7 +713,7 @@ fn is_windows_reserved_name(name: &str) -> bool {
 }
 
 fn unique_name(name: String, used: &mut HashSet<String>) -> String {
-    if used.insert(name.clone()) {
+    if used.insert(name.to_lowercase()) {
         return name;
     }
     let path = Path::new(&name);
@@ -616,11 +723,17 @@ fn unique_name(name: String, used: &mut HashSet<String>) -> String {
         .unwrap_or("file");
     let extension = path.extension().and_then(|value| value.to_str());
     for suffix in 2..=MAX_FILES + 1 {
+        let suffix = format!(" ({suffix})");
         let candidate = match extension {
-            Some(extension) => format!("{stem} ({suffix}).{extension}"),
-            None => format!("{stem} ({suffix})"),
+            Some(extension) if extension.len() + suffix.len() + 1 < 200 => format!(
+                "{}{}.{}",
+                truncate_utf8(stem, 200 - extension.len() - suffix.len() - 1),
+                suffix,
+                extension
+            ),
+            _ => format!("{}{}", truncate_utf8(&name, 200 - suffix.len()), suffix),
         };
-        if used.insert(candidate.clone()) {
+        if used.insert(candidate.to_lowercase()) {
             return candidate;
         }
     }
@@ -644,6 +757,123 @@ mod tests {
         let path = directory.join(name);
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn late_acknowledgements_do_not_cancel_the_new_transfer() {
+        let mut sender = FileTransfers::new("late-ack");
+        sender.begin_image_outbound(1, b"old").unwrap();
+        while sender.next_outbound().unwrap().is_some() {}
+        sender.cancel_outbound("new copy");
+        sender.begin_image_outbound(2, b"new").unwrap();
+        sender
+            .receive(FileTransferMessage::Accepted { transfer_id: 1 })
+            .unwrap();
+        assert_eq!(sender.outbound_id(), Some(2));
+        sender
+            .receive(FileTransferMessage::Cancel {
+                transfer_id: 1,
+                reason: "late cancellation".into(),
+            })
+            .unwrap();
+        assert_eq!(sender.outbound_id(), Some(2));
+    }
+
+    #[test]
+    fn completed_transfer_acceptance_is_idempotent() {
+        let mut sender = FileTransfers::new("duplicate-ack");
+        sender.begin_image_outbound(1, b"image").unwrap();
+        while sender.next_outbound().unwrap().is_some() {}
+        sender
+            .receive(FileTransferMessage::Accepted { transfer_id: 1 })
+            .unwrap();
+        sender
+            .receive(FileTransferMessage::Accepted { transfer_id: 1 })
+            .unwrap();
+        assert!(!sender.has_outbound());
+    }
+
+    #[test]
+    fn stalled_transfer_and_missing_ack_expire() {
+        let mut sender = FileTransfers::new("deadline");
+        sender.begin_image_outbound(1, b"image").unwrap();
+        assert!(sender.expired(
+            Instant::now() + Duration::from_secs(31),
+            Duration::from_secs(30)
+        ));
+        while sender.next_outbound().unwrap().is_some() {}
+        assert!(sender.expired(
+            Instant::now() + Duration::from_secs(31),
+            Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
+    fn filenames_are_unique_on_case_insensitive_destinations_and_bounded() {
+        let mut used = HashSet::new();
+        assert_eq!(unique_name("Report.txt".into(), &mut used), "Report.txt");
+        assert_eq!(
+            unique_name("report.txt".into(), &mut used),
+            "report (2).txt"
+        );
+        assert!(validate_manifest(
+            TransferPurpose::Files,
+            &[
+                FileMeta {
+                    name: "Report.txt".into(),
+                    size: 0
+                },
+                FileMeta {
+                    name: "report.txt".into(),
+                    size: 0
+                },
+            ]
+        )
+        .is_err());
+        let name = portable_name(&"文件".repeat(100));
+        assert!(name.len() <= 200);
+        assert_eq!(portable_name(&name), name);
+        let first = unique_name(name.clone(), &mut used);
+        let second = unique_name(name, &mut used);
+        assert_ne!(first, second);
+        assert!(validate_manifest(
+            TransferPurpose::Files,
+            &[
+                FileMeta {
+                    name: first,
+                    size: 0
+                },
+                FileMeta {
+                    name: second,
+                    size: 0
+                },
+            ]
+        )
+        .is_ok());
+        let reserved = portable_name(&format!("CON.{}", "a".repeat(300)));
+        assert!(reserved.len() <= 200);
+        assert_eq!(portable_name(&reserved), reserved);
+    }
+
+    #[test]
+    fn same_size_modified_source_is_rejected() {
+        let path = temp_file("modified.bin", b"old");
+        let mut sender = FileTransfers::new("modified-source");
+        sender.begin_outbound(1, vec![path.clone()]).unwrap();
+        std::fs::write(&path, b"new").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        assert!(sender
+            .next_outbound()
+            .unwrap_err()
+            .to_string()
+            .contains("changed"));
+        sender.cancel_outbound("test complete");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

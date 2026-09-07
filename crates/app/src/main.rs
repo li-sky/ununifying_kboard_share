@@ -228,6 +228,7 @@ fn run(paths: RuntimePaths) -> Result<()> {
     let session_active = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
     start_registry_reporter(cfg.clone(), shutdown.clone())?;
+    let clipboard_status = Arc::new(AtomicU8::new(kbshare_tray::CLIPBOARD_DISABLED));
     let tray_cfg = TrayConfig {
         app_name: "kbshare".to_string(),
         local_id: cfg.local_id.clone(),
@@ -236,6 +237,7 @@ fn run(paths: RuntimePaths) -> Result<()> {
         config_dir: Some(paths.config_dir.clone()),
         log_dir: Some(paths.log_dir.clone()),
         waiting_for_peer: cfg.remote_id.trim().is_empty(),
+        clipboard_status: clipboard_status.clone(),
     };
 
     if cfg.remote_id.trim().is_empty() {
@@ -294,6 +296,7 @@ fn run(paths: RuntimePaths) -> Result<()> {
     let clipboard = clipboard::start(
         clipboard::ClipboardConfig {
             enabled: cfg.clipboard_enabled,
+            status: clipboard_status,
             local_id: cfg.local_id.clone(),
             remote_id: cfg.remote_id.clone(),
             keyboard_port: cfg.tcp_port,

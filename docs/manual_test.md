@@ -173,3 +173,31 @@ capture 回调，调用 `on_panic_hotkey`。目前请用**杀进程**来模拟�
 - Verify reconnects on both Windows and Linux, including sleep/resume. Automated
   tests cover TLS and simulated injection failure, but do not exercise real OS
   input permissions or hardware failures.
+
+## Clipboard v4 regression checks
+
+Update and restart **both peers** before these checks. Version 3 clipboard peers
+are rejected explicitly; the keyboard protocol is unchanged.
+
+1. Copy different text on both machines nearly simultaneously. They must converge
+   to one value, and copying again on either side must synchronize the new value.
+2. Start a large image/file transfer, then copy new local text on the receiving
+   machine. The old transfer must never replace that text when its queued chunks arrive.
+3. Rapidly copy several files/images while acknowledgements are in flight. Late
+   acknowledgements and cancelled-transfer chunks must not disconnect the channel.
+4. Block the clipboard port with a packet-drop rule while idle. The tray must show
+   disconnected after the liveness deadline, and ready after connectivity returns.
+5. Change a file at the same path, then copy it again. Updated size/mtime must cause
+   a new transfer. Repair an initially unreadable file and check that retry succeeds.
+6. Copy rich text from a browser or word processor. Plain text, HTML and RTF (when
+   supplied by the source app) should be available together on the destination.
+7. Transfer `Report.txt` and `report.txt` from Linux to Windows. They must arrive
+   under distinct, usable names. Check long Unicode filenames as well.
+8. Leave an unchanged image in the clipboard. It must not continuously bounce
+   between peers, and tray status should settle at ready.
+9. While transferring, inspect the clipboard tray status independently of keyboard
+   mode. Failed/rejected transfers should show failed and provide a log reason.
+
+Automated tests use a fake clipboard backend and real localhost TLS; actual
+Windows/Wayland clipboard format conversion and desktop integration still require
+these two-machine checks.
