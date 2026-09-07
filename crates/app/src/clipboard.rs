@@ -710,24 +710,28 @@ fn is_transient_socket_error(error: &io::Error) -> bool {
 }
 
 fn resolve_peer_addresses(config: &ClipboardConfig) -> Vec<String> {
+    let mut addresses = Vec::new();
     if let Some(base_url) = &config.vps_base_url {
         if let Ok(entry) = RegistryClient::new(base_url).lookup(&config.remote_id) {
             if !entry.ips.is_empty() {
                 // Discovery records the keyboard port. Clipboard uses the
                 // locally configured dedicated port on the same addresses.
-                return entry
-                    .ips
-                    .into_iter()
-                    .map(|ip| format!("{ip}:{}", config.port))
-                    .collect();
+                addresses.extend(
+                    entry
+                        .ips
+                        .into_iter()
+                        .map(|ip| format!("{ip}:{}", config.port)),
+                );
             }
         }
     }
-    config
-        .fallback_remote_ips
-        .iter()
-        .map(|ip| format!("{ip}:{}", config.port))
-        .collect()
+    for ip in &config.fallback_remote_ips {
+        let address = format!("{ip}:{}", config.port);
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    addresses
 }
 
 fn prepare_tcp(tcp: &TcpStream) -> Result<()> {

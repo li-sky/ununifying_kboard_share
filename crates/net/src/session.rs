@@ -62,7 +62,7 @@ fn drive_client_handshake(conn: &mut ClientConnection, tcp: &TcpStream) -> Resul
     }
     // Flush any trailing handshake bytes.
     while conn.wants_write() {
-        conn.write_tls(&mut tcp).ok();
+        conn.write_tls(&mut tcp).context("flush handshake")?;
     }
     let peer_certs = conn
         .peer_certificates()
@@ -89,7 +89,7 @@ fn drive_server_handshake(conn: &mut ServerConnection, tcp: &TcpStream) -> Resul
         }
     }
     while conn.wants_write() {
-        conn.write_tls(&mut tcp).ok();
+        conn.write_tls(&mut tcp).context("flush handshake")?;
     }
     let peer_certs = conn.peer_certificates();
     let fp = peer_certs
@@ -123,7 +123,8 @@ where
     }
 }
 
-/// Helper: read one complete NDJSON line from a stream into a Message.
+/// Read a message, returning `None` only for a temporary read timeout.
+/// A closed stream returns `UnexpectedEof`, distinct from a live idle peer.
 pub fn recv_message<S: Read>(stream: &mut S, decoder: &mut LineDecoder) -> Result<Option<Message>> {
     // Fast path: already buffered.
     if let Some(msg) = decoder.next_message()? {
@@ -132,7 +133,11 @@ pub fn recv_message<S: Read>(stream: &mut S, decoder: &mut LineDecoder) -> Resul
     let mut buf = [0u8; 4096];
     loop {
         match stream.read(&mut buf) {
-            Ok(0) => return Ok(None), // EOF
+            Ok(0) => {
+                return Err(
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed connection").into(),
+                )
+            }
             Ok(n) => {
                 decoder.extend(&buf[..n]);
                 if let Some(msg) = decoder.next_message()? {
@@ -175,7 +180,13 @@ where
     loop {
         match recv_message(&mut stream, &mut decoder) {
             Ok(Some(msg)) => on_message(msg),
-            Ok(None) => return SessionEnd::Eof,
+            Ok(None) => continue,
+            Err(e)
+                if e.downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::UnexpectedEof) =>
+            {
+                return SessionEnd::Eof
+            }
             Err(e) => return SessionEnd::Error(e),
         }
     }
@@ -187,4 +198,33 @@ where
     F: FnMut(Message),
 {
     run_client_session(stream, on_message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn timeout_is_distinct_from_eof_and_keeps_partial_frame() {
+        struct Timeout;
+        impl Read for Timeout {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::TimedOut.into())
+            }
+        }
+        let mut decoder = LineDecoder::new();
+        let message = Message::Flush { id: "peer".into() };
+        let frame = encode_line(&message).unwrap();
+        decoder.extend(&frame[..5]);
+        assert!(recv_message(&mut Timeout, &mut decoder).unwrap().is_none());
+        let mut remaining = io::Cursor::new(&frame[5..]);
+        assert_eq!(
+            recv_message(&mut remaining, &mut decoder).unwrap(),
+            Some(message)
+        );
+        let error = recv_message(&mut io::empty(), &mut decoder).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
 }

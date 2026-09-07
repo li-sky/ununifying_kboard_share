@@ -155,3 +155,21 @@ capture 回调，调用 `on_panic_hotkey`。目前请用**杀进程**来模拟�
 | 证书被替换                       | 连接被 trust store 拒绝    |
 | 未知对端 + auto_trust_first_seen | 自动学习并继续             |
 | 未知对端 + 严格模式              | 拒绝并报 `unknown`         |
+
+## Connection lifecycle regression checks
+
+- Start a peer with a sleeping or unresponsive Logitech receiver. The keyboard
+  session must establish without waiting for device discovery, and remain alive
+  while discovery retries in the background.
+- Set different `heartbeat_secs` values on the two updated peers (for example,
+  0.05 and 10). Heartbeat transmission is capped at one second and the receive
+  grace is at least five seconds, so differing settings must not cause reconnects.
+- Disconnect the network while holding Ctrl remotely. Local forwarding must stop
+  and cleanup must attempt every injected key release. Socket writes now have a
+  500 ms timeout; cleanup does not write to the failed peer.
+- Publish an unreachable registry address while configuring a reachable fallback.
+  Both keyboard and clipboard channels must try the fallback after discovery
+  addresses fail.
+- Verify reconnects on both Windows and Linux, including sleep/resume. Automated
+  tests cover TLS and simulated injection failure, but do not exercise real OS
+  input permissions or hardware failures.
