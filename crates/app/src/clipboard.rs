@@ -5,6 +5,8 @@
 //! text payloads can take time to encrypt; neither is allowed onto the
 //! latency-sensitive keyboard path.
 
+#[path = "clipboard_deferred.rs"]
+mod deferred;
 #[path = "clipboard_files.rs"]
 mod files;
 #[path = "clipboard_transport.rs"]
@@ -31,7 +33,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const CLIPBOARD_PROTOCOL_VERSION: u32 = 4;
+const CLIPBOARD_PROTOCOL_VERSION: u32 = 5;
 const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 // JSON may encode one control byte as a six-byte `\u00xx` escape.
 const MAX_FRAME_BYTES: usize = MAX_CLIPBOARD_BYTES * 6 + 4096;
@@ -183,6 +185,7 @@ struct ClipboardState {
     pending: bool,
     last_attempt: Option<Instant>,
     inbound_revision: Option<(u64, Revision)>,
+    deferred: Option<deferred::Provider>,
     transfers: FileTransfers,
     received_directories: VecDeque<PathBuf>,
 }
@@ -207,6 +210,7 @@ impl ClipboardState {
             pending: false,
             last_attempt: None,
             inbound_revision: None,
+            deferred: None,
             transfers: FileTransfers::new(peer_id),
             received_directories: VecDeque::new(),
         })
@@ -222,6 +226,7 @@ impl ClipboardState {
     }
 
     fn on_session_lost(&mut self) {
+        self.deferred.take();
         self.transfers.cancel_outbound("session lost");
         self.transfers.cancel_inbound();
         self.inbound_revision = None;
@@ -479,7 +484,21 @@ fn drive_clipboard(
             handle_incoming(link, config, clipboard, message)?;
         }
         if verified {
-            if clipboard.transfers.has_outbound() || clipboard.transfers.inbound_id().is_some() {
+            if let Some(id) = clipboard.deferred.as_ref().and_then(|p| p.take_request()) {
+                // Validate ownership again; a local copy can supersede the promise.
+                poll_local(link, config, clipboard, true)?;
+                if let Some(request) = clipboard.transfers.request_inbound(id)? {
+                    send_transfer_message(link, config, clipboard.revision.clone(), request)?;
+                    tracing::info!(transfer_id = id, "paste requested remote clipboard files");
+                }
+            }
+            if clipboard.transfers.waiting_for_request() {
+                config
+                    .status
+                    .store(kbshare_tray::CLIPBOARD_AVAILABLE, Ordering::Relaxed);
+            } else if clipboard.transfers.has_outbound()
+                || clipboard.transfers.inbound_id().is_some()
+            {
                 config
                     .status
                     .store(kbshare_tray::CLIPBOARD_TRANSFERRING, Ordering::Relaxed);
@@ -545,6 +564,14 @@ fn poll_local(
     clipboard: &mut ClipboardState,
     include_image: bool,
 ) -> Result<()> {
+    if let Some(provider) = &clipboard.deferred {
+        // Reading our own URI/virtual-file promise would trigger an eager
+        // download. Ownership checks are metadata-only on every platform.
+        if provider.owns() {
+            return Ok(());
+        }
+        cancel_transfers(link, config, clipboard, "local clipboard ownership changed")?;
+    }
     let Some(current) = observe_clipboard(
         clipboard.clipboard.as_ref(),
         include_image,
@@ -575,6 +602,7 @@ fn cancel_transfers(
     clipboard: &mut ClipboardState,
     reason: &str,
 ) -> Result<()> {
+    clipboard.deferred.take();
     if let Some(cancel) = clipboard.transfers.cancel_outbound(reason) {
         send_transfer_message(link, config, clipboard.revision.clone(), cancel)?;
     }
@@ -688,6 +716,14 @@ fn handle_incoming(
                 &message,
                 FileTransferMessage::Accepted { .. } | FileTransferMessage::Cancel { .. }
             ) && clipboard.transfers.outbound_id() == Some(transfer_id);
+            if matches!(&message, FileTransferMessage::Cancel { .. })
+                && clipboard
+                    .deferred
+                    .as_ref()
+                    .is_some_and(|p| p.id() == transfer_id)
+            {
+                clipboard.deferred.take();
+            }
             let is_offer = matches!(&message, FileTransferMessage::Offer { .. });
             let is_accepted = matches!(&message, FileTransferMessage::Accepted { .. });
             match clipboard.transfers.receive(message) {
@@ -716,7 +752,17 @@ fn handle_incoming(
                                 .iter()
                                 .map(|path| clipboard_file_value(path))
                                 .collect::<Vec<_>>();
-                            if let Err(error) = clipboard.clipboard.set_files(clipboard_paths) {
+                            if let Some(provider) = clipboard
+                                .deferred
+                                .as_ref()
+                                .filter(|p| p.id() == transfer_id)
+                            {
+                                // Keep the promise alive while the requesting application
+                                // consumes it; replacing clipboard ownership here breaks paste.
+                                provider.complete(paths.clone());
+                            } else if let Err(error) =
+                                clipboard.clipboard.set_files(clipboard_paths)
+                            {
                                 let _ = std::fs::remove_dir_all(&directory);
                                 return Err(anyhow!(
                                     "write received files to system clipboard: {error}"
@@ -779,12 +825,47 @@ fn handle_incoming(
                         );
                     }
                     if is_offer {
-                        tracing::info!("receiving clipboard payload from peer");
+                        if let Some((id, files)) = clipboard.transfers.deferred_inbound() {
+                            match deferred::Provider::new(id, files.to_vec()) {
+                                Ok(provider) => {
+                                    clipboard.deferred = Some(provider);
+                                    config.status.store(
+                                        kbshare_tray::CLIPBOARD_AVAILABLE,
+                                        Ordering::Relaxed,
+                                    );
+                                    tracing::info!(
+                                        transfer_id = id,
+                                        "remote files available; waiting for a paste request"
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::warn!(error = %error, "cannot publish native clipboard file promise");
+                                    clipboard.transfers.cancel_inbound();
+                                    clipboard.inbound_revision = None;
+                                    config
+                                        .status
+                                        .store(kbshare_tray::CLIPBOARD_FAILED, Ordering::Relaxed);
+                                    return send_transfer_message(
+                                        stream,
+                                        config,
+                                        revision,
+                                        FileTransferMessage::Cancel {
+                                            transfer_id,
+                                            reason: "native deferred clipboard unavailable".into(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        if clipboard.deferred.is_none() {
+                            tracing::info!("receiving clipboard payload from peer");
+                        }
                     } else if is_accepted {
                         tracing::info!("peer validated clipboard payload");
                     }
                 }
                 Err(error) => {
+                    clipboard.deferred.take();
                     clipboard.transfers.cancel_inbound();
                     clipboard.transfers.reject_inbound(transfer_id);
                     clipboard.inbound_revision = None;

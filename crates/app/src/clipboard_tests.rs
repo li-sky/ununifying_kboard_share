@@ -129,6 +129,7 @@ fn state(peer: &str) -> (ClipboardState, FakeClipboard) {
             pending: false,
             last_attempt: None,
             inbound_revision: None,
+            deferred: None,
             transfers: FileTransfers::new(peer),
             received_directories: VecDeque::new(),
         },

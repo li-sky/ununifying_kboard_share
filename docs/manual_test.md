@@ -174,9 +174,9 @@ capture 回调，调用 `on_panic_hotkey`。目前请用**杀进程**来模拟�
   tests cover TLS and simulated injection failure, but do not exercise real OS
   input permissions or hardware failures.
 
-## Clipboard v4 regression checks
+## Clipboard v5 regression checks
 
-Update and restart **both peers** before these checks. Version 3 clipboard peers
+Update and restart **both peers** before these checks. Version 3/4 clipboard peers
 are rejected explicitly; the keyboard protocol is unchanged.
 
 1. Copy different text on both machines nearly simultaneously. They must converge
@@ -201,3 +201,32 @@ are rejected explicitly; the keyboard protocol is unchanged.
 Automated tests use a fake clipboard backend and real localhost TLS; actual
 Windows/Wayland clipboard format conversion and desktop integration still require
 these two-machine checks.
+
+## Deferred clipboard files (v5)
+
+Run in both directions with Windows Explorer and Linux file managers, separately
+on X11 and Wayland with ext-data-control or wlr-data-control support.
+
+1. Copy files totalling 10 MiB minus one byte: download should start immediately.
+   Copy exactly 10 MiB, then two 5 MiB files: only the offer should be sent until
+   a native content request. Inspect logs and the receive directory; it must not
+   be created before the request. Disable clipboard-history tools for this check.
+2. Leave the large offer idle for over 30 seconds, then paste via the file manager
+   context menu. Download should start without a tray action, finish with matching
+   SHA-256 hashes, and leave keyboard forwarding responsive. Repeat paste into a
+   second directory: it should use the completed local files without re-downloading.
+3. On Windows, format enumeration, FileGroupDescriptorW and stream Stat/Seek must
+   not request contents. The first nonempty IStream read starts the download.
+   On X11, TARGETS probes must not start it; requesting a file URI format does.
+4. Copy local text while the large paste waits, and separately disconnect either
+   peer. The pending native request must finish with failure; old files must not
+   replace new clipboard contents. Reconnect and make a fresh copy to retry.
+5. Modify or delete the source file before pasting. The transfer must fail rather
+   than return contents that no longer match the offer. Also test no disk space.
+6. Test a near-2 GiB file over a slow link. Check whether each target file manager
+   tolerates waiting for the download; Linux URI consumers can have their own
+   timeout. This is whole-file staging, not partial-file access or resumable transfer.
+7. Enable clipboard history and record whether it requests contents eagerly.
+   Native content requests from history tools can trigger downloads too.
+8. Test unsupported Wayland data-control: the tray should show failed and the log
+   explain missing protocol support, without eagerly transferring the large files.

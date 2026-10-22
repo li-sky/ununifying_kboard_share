@@ -13,5 +13,6 @@
 
 # Rust build and runtime state
 /target/
+/dist/
 /runtime_client/
 /runtime_host/

@@ -1,355 +1,204 @@
 # kbshare
 
-从零重写的版本。目标与原项目一致：根据鼠标活动状态，把一台机器上的键盘输入安全转发到另一台机器。
+[![CI](https://github.com/li-sky/ununifying_kboard_share/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/li-sky/ununifying_kboard_share/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/li-sky/ununifying_kboard_share)](https://github.com/li-sky/ununifying_kboard_share/releases)
 
-## 设计要点
+在 Windows 和 Linux 之间共享键盘与剪贴板。两台电脑运行同一个程序，kbshare 根据鼠标活动和设备布局切换键盘输入；搭配支持 Easy-Switch 的 Logitech 鼠标，还可以在越过屏幕边缘时切换鼠标连接的电脑。
 
-- **语言**：Rust（主体使用 blocking I/O + `std::thread`；Wayland portal
-  适配器在独立线程内运行一个单线程异步循环）。
-- **分层**：
-  - `core` —— 纯逻辑，零 I/O。键码映射、状态机、按键跟踪、协议编解码。
-  - `net`  —— TLS + 自签证书 + SHA256 指纹 TOFU + 极简注册表客户端。
-  - `platform` —— 键盘捕捉、鼠标监听、键盘注入。Windows / Linux / Mock 三套实现。
-  - `app` —— 统一可执行程序 `kbshare`，每台机器运行同一二进制。
-  - `registry` —— 节点注册服务可执行程序（可选，用于云端发现）。
-  - `tray` —— 可复用的系统托盘库与配置编辑器。
-  - `flow` —— Logitech HID++ 探测与 Easy-Switch。
-- **协议**：NDJSON。每条消息是一行 JSON，方便日志、抓包、重放、测试。
-- **剪贴板**：文本、图片和文件剪贴板使用独立的 TLS 连接和工作线程，默认监听 `5006`；
-  大段文本、剪贴板 API 卡顿或剪贴板连接重连都不会占用键盘的 `5005` 通道。
-- **状态机**：`Local ↔ Remote`，纯函数 `transition(state, event) -> (state, action)`，100% 可单测。
-- **按键跟踪**：`PressedKeys` 维护“我们当前认为对端按下的键”，断线/切模式时统一 release，杜绝卡键。
-- **测试**：
-  - `core`：单元测试 + 基于 Mock 平台 + in-memory transport 的集成测试。
-  - `net`：rustls 用 `tokio`-free 的 `Stream` 模式，测试走 TcpListener on 127.0.0.1。
-  - `platform`：mock 实现覆盖所有 trait，binaries 的集成测试不依赖真实键盘。
-  - 真实键盘联调：由使用者在本地人工触发（见 `docs/manual_test.md`）。
+kbshare 使用 Rust 编写。键盘与剪贴板通过各自独立的 TLS 连接传输，文件下载不会占用键盘通道。切回本机或连接断开时，程序会释放已跟踪的按键。
 
-## 目录
+## 下载
 
-```
-ununifying_kboard_share/
-  Cargo.toml                 # workspace 定义与共享依赖
-  Cargo.lock                 # workspace 依赖锁定文件
-  rust-toolchain.toml        # Rust 工具链版本
-  crates/
-    core/                    # 协议、状态机与运行时纯逻辑
-    net/                     # TLS、证书、信任与注册发现
-    platform/                # Windows/Linux/Mock 平台适配
-    app/                     # 统一 kbshare 可执行程序
-    registry/                # 节点注册服务可执行程序（可选）
-    tray/                    # 系统托盘库与配置编辑器
-    flow/                    # Logitech HID++ 探测与 Easy-Switch
-  docs/
-    manual_test.md           # 双机手动联调流程
-  examples/                  # 可提交的配置样例
-  logs/                      # 运行日志（不提交）
-  target/                    # Cargo 构建产物（不提交）
-```
+当前版本：**1.0.0**。从 [GitHub Releases](https://github.com/li-sky/ununifying_kboard_share/releases/latest) 下载，版本变化见 [CHANGELOG](CHANGELOG.md)。
 
-`crates/`、`docs/` 和 `examples/` 是项目源码与文档；`logs/`、
-`target/` 以及运行时目录下的证书、信任库和实际配置均为本机状态，由 `.gitignore`
-排除。新增配置时以 `examples/` 为模板，避免把真实地址或身份材料提交到仓库。
+| 系统 | 下载文件 | 要求 |
+| --- | --- | --- |
+| Windows x64 | `kbshare-v1.0.0-x86_64-pc-windows-msvc.zip` | Windows 桌面环境 |
+| Linux x64 | `kbshare-v1.0.0-x86_64-unknown-linux-gnu.tar.gz` | Ubuntu 24.04 或兼容系统，glibc 2.39+ |
 
-## 构建
+每个压缩包包含以下程序，以及配置样例和使用文档：
 
-```powershell
-cargo build
-cargo test
-```
+| 程序 | 用途 |
+| --- | --- |
+| `kbshare` | 两台电脑都需要运行的主程序 |
+| `kbshare-config` | 独立启动浏览器配置编辑器 |
+| `kbshare-flow` | 探测 Logitech HID++ 设备、手动切换 Easy-Switch 通道 |
+| `kbshare-registry` | 可选的节点发现服务，部署在服务器上 |
 
-Linux 构建需要 udev 和 D-Bus 开发包（包名以 Debian/Ubuntu 为例）：
+Release 提供 `SHA256SUMS`，可用于核对下载文件。Linux 包还包含 udev 和 Polkit 规则；其他架构或较旧发行版可尝试[从源码构建](#从源码构建)。
+
+## 快速开始
+
+1. 在两台电脑上解压对应的压缩包，运行 `kbshare.exe`（Windows）或 `./kbshare`（Linux）。首次启动会创建配置文件并在默认浏览器中打开配置向导。
+2. 分别设置本机名称和对端名称，例如 A 机使用 `alpha` / `beta`，B 机使用 `beta` / `alpha`。
+3. 按向导生成各自的证书，填写对端 IP；需要自动发现时，再配置可选的注册服务。核对双方显示的证书指纹。
+4. 如果使用 Logitech Easy-Switch，探测鼠标、填写通道，并在设备画布上排列电脑位置。不使用此功能时可以跳过鼠标配置。
+5. 保存配置，程序会自动重启。允许连接所需的防火墙访问；Wayland 桌面还需按系统对话框授予输入权限。
+
+默认端口为 **TCP 5005（键盘）** 和 **TCP 5006（剪贴板）**。两台机器必须能够直接连接；注册服务只帮助查找地址，不提供流量中继或 NAT 穿透。
+
+托盘菜单可以查看连接状态与指纹、修改或加载配置、打开日志目录和退出。Linux 的 GNOME 桌面需要 AppIndicator / KStatusNotifierItem 扩展才能显示托盘；KDE Plasma 原生支持。
+
+在可捕获按键的情况下，`Ctrl+Alt+Shift+Pause` 可退出程序。不要在同一个桌面会话中同时运行多个 kbshare 实例，以免输入捕获互相干扰。
+
+## 配置
+
+默认读取当前工作目录的 `config.json`，也可以显式指定路径：
 
 ```bash
-sudo apt install pkg-config libudev-dev libdbus-1-dev
+./kbshare --config /path/to/config.json
 ```
 
-## 本地运行
+Windows 对应命令为 `.\kbshare.exe --config C:\path\to\config.json`。
 
-每台机器运行同一个 `kbshare` 可执行程序，使用各自的配置文件。两台机器的 `local_id` 和 `remote_id` 必须互换：
-
-```powershell
-cargo run -p kbshare -- --config runtime_alpha/config.json
-cargo run -p kbshare -- --config runtime_beta/config.json
-```
-
-真实键盘捕获与注入的双机验证步骤见 `docs/manual_test.md`。
-
-## 剪贴板共享
-
-**协议升级：两端都需更新并重启。** 当前剪贴板协议为 v4，与旧版 v3 不兼容；
-键盘协议不受影响。
-
-剪贴板文本、图片和文件默认双向同步。两端都需要开放并配置相同的独立端口：
+以下是 A 机的最小配置示例；B 机需互换两个 ID，并把 IP 改成 A 机的地址：
 
 ```json
 {
+  "local_id": "alpha",
+  "remote_id": "beta",
+  "fallback_remote_ips": ["192.168.1.42"],
   "tcp_port": 5005,
   "clipboard_enabled": true,
   "clipboard_port": 5006
 }
 ```
 
-连接建立时不会用一台机器的旧内容覆盖另一台；连接后任意一端发生的下一次
-文本、截图或文件复制会通过独立 TLS 会话发送到对端。原生图片剪贴板统一编码为 PNG；
-图片和文件内容均按 128 KiB 分块流式传输，
-接收完成并通过 SHA-256 校验后先写入临时目录。图片会解码并写回原生图片剪贴板；
-文件则把接收端本地路径放进系统剪贴板，所以可以直接在资源管理器或文件管理器中粘贴。
-每次最多 32 个普通文件、总计 2 GiB；
-单张图片编码后最多 64 MiB、解码后最多约 3355 万像素，目录暂不共享；纯文本、HTML 和 RTF 合计上限为 1 MiB。剪贴板会话复用节点证书和同一份 TOFU
-信任库，但拥有独立的 socket、读写循环和系统剪贴板轮询线程，因此断开或传输大文件
-不会阻塞键盘输入。
+更多字段见 [examples/config.json](examples/config.json)。证书和信任库的相对路径以配置文件所在目录为基准。每台机器应生成自己的证书；发行包不携带证书或私钥。
 
-托盘菜单现在单独显示剪贴板状态：disabled、disconnected、ready、transferring 或 failed。
-失败原因可通过“Open log folder”查看。文本会等待对端应用确认；文件和图片收到验证确认后才结束传输。
-两端同时复制时，逻辑版本号和节点 ID 决定一致的结果；本地新复制会取消旧的接收任务，
-避免较慢的文件或图片传输覆盖新内容。重连会重试未确认的本地更新。
+默认使用首次信任（TOFU）：首次见到对端时记录证书指纹，之后拒绝指纹不匹配的连接。`auto_trust_first_seen: false` 会拒绝尚未加入信任库的对端。更换机器或证书后，应先确认身份再更新信任记录。
 
-TLS I/O 使用独立线程和有界队列；每秒发送保活，Hello 等待上限 5 秒，
-对端无消息上限 15 秒，传输或确认无进展上限 30 秒。
-文件名会按不区分大小写的规则去重并限制长度；图片按像素摘要比较，避免 PNG 重编码产生回传。
-文件变化检测包含路径、大小和修改时间。保留原有的轮询机制：极短时间内的连续复制、
-以及内容和文件元数据完全相同的重复复制，不保证每次都形成独立更新。
+配置编辑器仅监听本机 `127.0.0.1` 的随机端口，并使用一次性 URL。保存时会校验配置、保留 `.json.bak` 备份并重启程序。如果浏览器未自动打开，可从终端输出中取得 URL。
 
-若不需要此功能，将 `clipboard_enabled` 设为 `false`。防火墙只需允许监听方的
-`tcp_port` 和 `clipboard_port`；云端注册表仍只负责发现 IP，不接触剪贴板内容。
+## 剪贴板共享
 
-## 云端发现（可选）
+连接后，任一端新复制的文本、图片和普通文件都会同步到对端。建立连接时不会用一方已有的剪贴板覆盖另一方；不需要共享时，将 `clipboard_enabled` 设为 `false`。
 
-如果两台机器不在同一局域网，或者 IP 经常变动，可以在 VPS 上部署
-`kbshare-registry` 作为发现服务。每台 kbshare 启动后会定期把可供对端直连
-的本机 IP 报告给注册表，连接前从注册表查询对端 IP。透明代理 TUN 使用的
-回环、链路本地和 RFC 2544 基准测试地址不会被上报。
+| 内容 | 传输方式与限制 |
+| --- | --- |
+| 文本、HTML、RTF | 一起同步，合计不超过 1 MiB |
+| 图片 | 编码为 PNG 后立即传输；编码后不超过 64 MiB，解码后不超过约 3355 万像素 |
+| 总计小于 10 MiB 的文件组 | 立即传输 |
+| 总计大于等于 10 MiB 的文件组 | 先同步文件信息，目标应用读取内容时才开始下载，通常发生在粘贴时 |
 
-### 编译
+一次最多共享 32 个普通文件，总大小不超过 2 GiB，暂不支持目录。图片和文件在接收完成、通过 SHA-256 校验后才交给目标应用。
 
-**方式一：在 VPS 上直接编译（推荐）**
+大文件延迟读取在 Windows 上使用 OLE 虚拟文件，在 Linux 上使用 X11 selection 或 Wayland ext/wlr data-control。使用时需注意：
 
-VPS 上装 Rust 工具链后直接编译，无需交叉编译：
+- 等待粘贴期间，源机器必须保持连接；复制新内容或断开连接会取消未完成的下载。
+- 剪贴板历史工具主动读取内容，也可能触发下载。
+- Wayland 合成器必须支持相应的 data-control 协议；部分 Linux 文件管理器可能因等待下载过久而超时。
+- 文件会完整下载到临时目录后交付，不支持部分文件读取或断点续传。
 
-```bash
-# 1. 安装 Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
+托盘会显示剪贴板的连接、等待粘贴、传输或失败状态。失败详情可从 **Open log folder** 查看。
 
-# 2. 拉代码
-git clone <your-repo-url> kbshare
-cd kbshare
+**升级到 1.0.0 时，请同时更新并重启两端。剪贴板协议 v5 与旧版 v3/v4 不兼容。**
 
-# 3. 编译（只编译 registry，不需要平台依赖）
-cargo build --release -p kbshare-registry
+## Logitech Easy-Switch
 
-# 4. 二进制在这里
-ls -lh target/release/kbshare-registry
-# -rwxr-xr-x 2.2M  kbshare-registry
-```
+Flow-lite 使用 HID++ 探测设备，并在指针越过配置中的屏幕边缘时发送 Easy-Switch 指令。需要鼠标本身支持相应功能；kbshare 不通过网络转发通用鼠标移动。
 
-**方式二：在 Windows 上交叉编译**
+在配置编辑器的 **Flow-lite** 页面中，填写两台电脑对应的通道并拖动设备位置。通道编号从 0 开始：鼠标上的设备 1、2、3 对应 `0`、`1`、`2`。布局会在两端连接后同步，较新的完整布局覆盖较旧布局。
 
-需要安装 musl 工具链和 linker，配置较复杂，不推荐。如果 VPS 架构与
-开发机不同（如 ARM），务必用方式一。
-
-### 部署到 VPS
-
-`kbshare-registry` 本身是纯 HTTP，监听 `0.0.0.0:8080`。生产环境应放在
-nginx 后面做 TLS 终止。
-
-**1. 安装二进制到系统路径：**
+可以使用命令行检查设备：
 
 ```bash
-sudo cp target/release/kbshare-registry /usr/local/bin/
-sudo chmod +x /usr/local/bin/kbshare-registry
+./kbshare-flow collections
+./kbshare-flow inspect
 ```
 
-**2. 安装 nginx 并申请证书：**
+手动切到设备 3 的示例（会实际切换鼠标连接）：
 
 ```bash
-sudo apt update
-sudo apt install -y nginx certbot python3-certbot-nginx
-
-# 申请 Let's Encrypt 证书（先确保域名 A 记录已指向 VPS IP）
-sudo certbot --nginx -d kbshare-registry.example.com
+./kbshare-flow switch --host 2 --slot 1
 ```
 
-**3. 配置 nginx 反向代理：**
+`slot` 应使用探测得到的接收器编号；蓝牙直连或不确定编号时可省略。探测前先移动鼠标将其唤醒；需要诊断 HID++ 通信时，设置 `KBSHARE_FLOW_DEBUG=1`。
 
-```nginx
-# /etc/nginx/sites-available/kbshare-registry
-server {
-    listen 443 ssl http2;
-    server_name kbshare-registry.example.com;
+### Linux 权限与桌面支持
 
-    ssl_certificate     /etc/letsencrypt/live/kbshare-registry.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/kbshare-registry.example.com/privkey.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-
-# HTTP 跳转 HTTPS
-server {
-    listen 80;
-    server_name kbshare-registry.example.com;
-    return 301 https://$host$request_uri;
-}
-```
-
-```bash
-sudo ln -sf /etc/nginx/sites-available/kbshare-registry /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-**4. 用 systemd 管理进程：**
-
-```ini
-# /etc/systemd/system/kbshare-registry.service
-[Unit]
-Description=kbshare registry
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/kbshare-registry --bind 127.0.0.1:8080
-Restart=always
-User=nobody
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl enable --now kbshare-registry
-```
-
-### 验证
-
-```bash
-curl https://kbshare-registry.example.com/health
-# {"status":"healthy"}
-```
-
-### 配置 kbshare 使用注册表
-
-在两台机器的 `config.json` 中填入 `vps_base_url`：
-
-```json
-{
-  "vps_base_url": "https://kbshare-registry.example.com",
-  ...
-}
-```
-
-或在配置编辑器的 **Connection** 页面填写 **Cloud discovery endpoint**。
-
-kbshare 启动时会：
-1. 向注册表 `POST /report` 报告本机 `node_id` 和 IP，之后每 30 秒刷新。
-2. 连接前 `GET /node/<remote_id>` 查询对端 IP。
-3. 如果注册表不可达或对端未注册，回退到 `fallback_remote_ips`。
-
-注册表只做 IP 发现，不参与 TLS 握手或按键转发——所有键盘数据仍然端到端
-加密，注册表看不到任何键盘输入。
-
-## 配置编辑器
-
-Windows 和 Linux 首次启动遇到空配置时，都会在默认浏览器打开相同的交互式配置向导。
-Windows 托盘菜单选择 **Edit configuration…** 也会打开该界面。
-Linux 状态栏通过 freedesktop StatusNotifierItem 提供相同的状态、指纹、加载配置、
-编辑配置、打开日志/配置目录和退出入口；GNOME 需要启用 AppIndicator/KStatusNotifierItem
-扩展，KDE Plasma 原生支持。
-Linux 的目录和浏览器入口通过 `xdg-open` 打开；加载配置使用浏览器原生文件选择器，
-导入 JSON 后检查并保存即可重启应用。
-点击 **Setup guide** 后按“本机名称 → 生成/确认 TLS 证书 → 云端发现对端（或手动 IP）→ 鼠标探测与通道 → 设备布局 → 检查应用”完成配置。
-证书步骤会显示 SHA-256 指纹；若配置路径已有证书和私钥则只校验并复用，不会覆盖。
-鼠标探测不是强制步骤；蓝牙设备或当前切换到另一通道的鼠标可以手动填写。
-界面同时保留身份、连接、Flow-lite 和高级 JSON 四个页面；保存时会校验必填字段，
-在原配置旁创建 `.json.bak`，随后自动重启使新配置生效。
-
-开发时也可以单独启动编辑器：
-
-```bash
-cargo run -p kbshare-tray --bin kbshare-config -- runtime_alpha/config.json kbshare
-```
-
-编辑器仅监听随机的 `127.0.0.1` 端口，并为每次启动生成一次性 URL。
-如果系统无法自动唤起浏览器，终端会打印该 URL，可手动复制打开。
-
-## Flow-lite（Logitech Easy-Switch）
-
-先在连接鼠标的机器上只读探测 HID++ 设备：
-
-```powershell
-cargo run -p kbshare-flow --bin kbshare-flow -- inspect
-```
-
-Windows 和 Linux 都支持 HID++ 探测与切换。Linux 通过 `/dev/hidraw*`
-访问设备；当前用户必须对 Logitech hidraw 节点有读写权限。仓库提供了
-适用于 USB 接收器、USB 直连和蓝牙设备的 udev 规则：
-
-Linux 配置界面的 Flow-Lite 页面可点击 **Install Linux HID access…**。程序会
-通过 Polkit 调起桌面认证窗口；授权后由最小化的特权 helper 原子安装规则、重新
-加载 udev 并立即重新探测鼠标。配置服务本身始终以普通用户运行。
+Logitech 设备访问需要当前用户对 `/dev/hidraw*` 有相应权限。配置页面的 **Install Linux HID access…** 可通过 Polkit 授权安装规则，也可以手动安装：
 
 ```bash
 sudo install -Dm644 packaging/udev/70-kbshare-logitech.rules \
   /etc/udev/rules.d/70-kbshare-logitech.rules
+sudo install -Dm644 packaging/polkit/org.kbshare.install-udev.policy \
+  /usr/share/polkit-1/actions/org.kbshare.install-udev.policy
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=hidraw
 ```
 
-发行包还应安装 `packaging/polkit/org.kbshare.install-udev.policy` 到
-`/usr/share/polkit-1/actions/`，以显示 kbshare 专用的认证动作；开发目录直接运行
-时会回退到 Polkit 的通用 `pkexec` 动作。
+必要时重新插拔接收器，再运行 `kbshare-flow inspect`。WSL 需要先完成 USB 透传，并能看到对应的 `/dev/hidraw*` 节点。
 
-重新插拔接收器后运行 `cargo run -p kbshare-flow --bin kbshare-flow -- collections`
-检查设备集合，再运行 `cargo run -p kbshare-flow --bin kbshare-flow -- inspect`
-探测鼠标。探测时应唤醒或移动无线鼠标；接收器在鼠标休眠时可能暂时返回
-`CONNECTION_REQUEST_FAILED`，程序会自动重试。若仍无结果，设置
-`KBSHARE_FLOW_DEBUG=1` 可输出 HID++ 请求和响应。
-WSL 不会自动暴露 Windows USB 设备；接收器需要先通过 USB 透传连接到 WSL，
-并确认发行版中出现 `/dev/hidraw*`，之后 Flow-lite 的操作与普通 Linux 相同。
+Wayland 键盘捕获和屏幕边缘检测使用 `InputCapture` portal 与 libei，键盘注入使用 `RemoteDesktop` portal 与 libei。桌面需要安装 `xdg-desktop-portal` 及提供对应接口的后端，并完成系统授权。关闭 Flow-lite 只跳过 Logitech 通道切换，仍可使用 Wayland 的边缘触发键盘远程模式。
 
-Linux 的 Flow 边缘判断按桌面协议自动选择实现：
+Portal 不可用时，程序会尝试 evdev / uinput，以及 X11 / XWayland 边缘检测回退。回退路径需要相应的设备访问权限；纯 Wayland 环境不保证有可用的 X11 回退。具体原因会写入日志。
 
-- Wayland 使用 `org.freedesktop.portal.InputCapture` 的 pointer barriers，并通过
-  EIS/libei receiver 完成标准会话握手。屏幕区域、多屏外边界、显示器热插拔均由
-  compositor 报告，不读取也不推测全局坐标；触发后立即释放捕获并把指针放回本机
-  边界内侧。
-- X11/XWayland 保留全局光标查询作为兼容回退。
+## 可选的云端发现
 
-Wayland 桌面必须安装 `xdg-desktop-portal` 及支持 InputCapture 的桌面 portal
-后端；首次使用时按桌面提示授权。如果 portal 不提供该接口，日志会明确说明并尝试
-X11/XWayland 回退。
+`kbshare-registry` 保存节点上报的地址，帮助 IP 经常变化的设备找到对端。它不接触键盘或剪贴板内容；发现地址无法连接时，客户端仍会尝试 `fallback_remote_ips`。
 
-Linux 键盘注入同样按会话选择后端。Wayland 优先通过
-`org.freedesktop.portal.RemoteDesktop` 授权，并使用 libei sender 把 evdev
-keycode 交给 compositor；成功时不访问 `/dev/uinput`。非 Wayland 会话以及 portal
-不可用时保留 uinput 回退。若两者均不可用，启动错误会同时列出 portal 和 uinput
-失败原因。授权对话框尚未完成时退出应用，会取消等待而不会卡住引擎线程。
+在两台机器的配置编辑器中填写 **Cloud discovery endpoint**，或设置 `vps_base_url`。服务器安装、HTTPS 反向代理和 systemd 配置见[注册服务部署文档](docs/registry.md)。
 
-键盘捕获与 Flow barrier 共用一个 InputCapture/libei receiver 会话。Wayland
-成功授权后不读取 `/dev/input/event*`：越过指向对端的屏幕边缘时 compositor
-开始截获键盘，指针向本机方向退回或对端返回时释放。`flow_lite.enabled=false`
-时仍可使用这种“仅键盘远程”模式，只跳过 Logitech HID 切换。Portal 不可用时才
-回退 evdev；若 evdev 也不可读，错误会同时列出两条捕获路径的失败原因。
+## 从源码构建
 
-`flow_lite.enabled` 开启后，鼠标从布局中指向当前对端的屏幕边缘切换机器；
-默认布局是本机在左、对端在右。host 编号从 0 开始，因此设备 3 的
-`host_index` 是 `2`。
+安装 Rust 工具链后，仓库中的 `rust-toolchain.toml` 会选择 stable，并包含 rustfmt 和 Clippy。
+Windows 需要 MSVC C++ 构建工具。Debian / Ubuntu 上先安装开发依赖：
 
-配置编辑器的 Flow-lite 页面提供二维设备画布。本机、当前配对端和手动添加的
-离线设备都可以拖动重排；节点位置决定鼠标从屏幕左、右、上、下哪条边切向
-当前在线对端。每个节点保存稳定 ID、显示名和 Easy-Switch 通道。
-
-两端建立 TLS 会话后会交换完整布局。布局采用版本号与 writer ID 做确定性的
-last-write-wins：较新的完整布局覆盖较旧布局，并写回对端配置；离线设备下次
-连接时也会收到当前最新版。修改布局后保存并重启任一端即可触发同步。
-
-Bolt/Unifying Host 推荐配置探测到的 receiver `slot`。蓝牙直连或不确定
-slot 时可省略，程序会使用 HID++ direct device index `0xff` 或扫描 receiver
-slot。也可单独验证切换：
-
-```powershell
-cargo run -p kbshare-flow -- switch --host 2 --slot 1
+```bash
+sudo apt install pkg-config libudev-dev libdbus-1-dev
 ```
+
+克隆并构建：
+
+```bash
+git clone https://github.com/li-sky/ununifying_kboard_share.git
+cd ununifying_kboard_share
+cargo build --workspace --bins --release --locked
+```
+
+产物位于 `target/release/`。开发时可以直接运行：
+
+```bash
+cargo run -p kbshare -- --config runtime_alpha/config.json
+```
+
+### 测试与发布
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked
+cargo test --workspace --locked
+```
+
+GitHub Actions 在分支推送和 Pull Request 时运行格式检查、Clippy、Linux / Windows 全工作区测试与 release 构建。现有 Clippy warning 会出现在日志中，编译或 lint error 会阻止通过。
+
+发布时更新 workspace 版本、`Cargo.lock`、CHANGELOG 和 `docs/releases/v<版本>.md`，提交后推送对应的 `v<版本>` 标签。CI 会核对标签与包版本，在所有检查通过后发布压缩包及 SHA-256 校验文件。
+
+自动测试覆盖状态机、协议、Mock 输入和本机 TLS 连接；真实键盘、桌面授权、Logitech 设备与跨机器剪贴板需要按[手动联调文档](docs/manual_test.md)验证。
+
+### 代码结构
+
+| 目录 | 职责 |
+| --- | --- |
+| `crates/app` | 主程序、连接生命周期与剪贴板同步 |
+| `crates/core` | 协议、键码映射、状态机与按键跟踪 |
+| `crates/net` | TLS、证书、信任库与节点发现 |
+| `crates/platform` | Windows、Linux 和 Mock 输入后端 |
+| `crates/tray` | 托盘和浏览器配置编辑器 |
+| `crates/flow` | Logitech HID++ 与设备布局 |
+| `crates/registry` | 可选的节点发现服务 |
+| `packaging` | Linux udev / Polkit 规则 |
+
+## 排查问题
+
+| 现象 | 优先检查 |
+| --- | --- |
+| 两端无法连接 | ID 是否互换、对端 IP 是否可达、防火墙是否允许 TCP 5005 / 5006、证书指纹是否匹配 |
+| 键盘可用，剪贴板不通 | 两端版本是否一致、是否启用剪贴板、TCP 5006 是否可达、托盘中的失败状态 |
+| 大文件复制后没有立即下载 | 文件组达到 10 MiB 时会等待目标应用读取；在对端粘贴，并保持源端在线 |
+| Linux 无法捕获或注入按键 | Portal 接口与授权，或 evdev / uinput 回退的设备权限 |
+| Logitech 探测不到鼠标 | 鼠标是否唤醒、当前连接通道、接收器 slot、Linux hidraw 权限 |
+| Linux 看不到托盘 | 桌面是否支持 StatusNotifierItem；GNOME 是否启用相应扩展 |
+
+日志通常位于配置文件旁的 `logs/kbshare.log`；使用 `runtime_*` 配置目录时，日志放在它的上一级目录下。可从托盘打开日志目录，或设置 `RUST_LOG=debug` 后重现问题。

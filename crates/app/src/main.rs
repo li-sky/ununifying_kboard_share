@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[command(about = "Share one keyboard and mouse between kbshare peers")]
+#[command(version, about = "Share one keyboard and mouse between kbshare peers")]
 struct Args {
     #[arg(short, long, default_value = "config.json")]
     config: PathBuf,

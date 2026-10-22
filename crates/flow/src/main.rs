@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(about = "Inspect and switch Logitech HID++ Easy-Switch hosts")]
+#[command(version, about = "Inspect and switch Logitech HID++ Easy-Switch hosts")]
 struct Args {
     #[command(subcommand)]
     command: Command,

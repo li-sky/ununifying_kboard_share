@@ -1410,7 +1410,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kbshare"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1423,6 +1423,7 @@ dependencies = [
  "kbshare-net",
  "kbshare-platform",
  "kbshare-tray",
+ "libc",
  "parking_lot",
  "rustls",
  "serde",
@@ -1432,11 +1433,17 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "url",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+ "windows",
+ "windows-core",
+ "x11rb",
 ]
 
 [[package]]
 name = "kbshare-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1446,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-flow"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
@@ -1459,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-net"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -1480,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-platform"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -1501,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-registry"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
@@ -1512,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-tray"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "image",

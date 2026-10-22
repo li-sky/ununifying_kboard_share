@@ -11,6 +11,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub const EAGER_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
 pub const MAX_FILES: usize = 32;
 pub const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -36,6 +38,9 @@ pub enum FileTransferMessage {
         transfer_id: u64,
         purpose: TransferPurpose,
         files: Vec<FileMeta>,
+    },
+    Request {
+        transfer_id: u64,
     },
     Chunk {
         transfer_id: u64,
@@ -64,6 +69,7 @@ impl FileTransferMessage {
     pub fn transfer_id(&self) -> u64 {
         match self {
             Self::Offer { transfer_id, .. }
+            | Self::Request { transfer_id }
             | Self::Chunk { transfer_id, .. }
             | Self::FileEnd { transfer_id, .. }
             | Self::Complete { transfer_id }
@@ -97,6 +103,7 @@ pub struct FileTransfers {
     root: PathBuf,
     outbound: Option<OutboundTransfer>,
     inbound: Option<InboundTransfer>,
+    deferred_inbound: Option<(u64, TransferPurpose, Vec<FileMeta>)>,
     retired_inbound: VecDeque<u64>,
     retired_outbound: VecDeque<u64>,
     last_inbound_progress: Instant,
@@ -128,6 +135,7 @@ impl FileTransfers {
                 .join(portable_name(peer_id)),
             outbound: None,
             inbound: None,
+            deferred_inbound: None,
             retired_inbound: VecDeque::new(),
             retired_outbound: VecDeque::new(),
             last_inbound_progress: Instant::now(),
@@ -142,14 +150,17 @@ impl FileTransfers {
     pub fn is_sending(&self) -> bool {
         self.outbound
             .as_ref()
-            .is_some_and(|transfer| !transfer.complete_sent)
+            .is_some_and(|transfer| transfer.requested && !transfer.complete_sent)
     }
 
     pub fn outbound_id(&self) -> Option<u64> {
         self.outbound.as_ref().map(|t| t.id)
     }
     pub fn inbound_id(&self) -> Option<u64> {
-        self.inbound.as_ref().map(|t| t.id)
+        self.inbound
+            .as_ref()
+            .map(|t| t.id)
+            .or_else(|| self.deferred_inbound.as_ref().map(|t| t.0))
     }
 
     pub fn cancel_outbound(&mut self, reason: &str) -> Option<FileTransferMessage> {
@@ -162,6 +173,9 @@ impl FileTransfers {
     }
 
     pub fn cancel_inbound(&mut self) {
+        if let Some((id, _, _)) = self.deferred_inbound.take() {
+            retire(&mut self.retired_inbound, id);
+        }
         if let Some(transfer) = self.inbound.take() {
             retire(&mut self.retired_inbound, transfer.id);
             let directory = transfer.directory.clone();
@@ -176,7 +190,7 @@ impl FileTransfers {
 
     pub fn expired(&self, now: Instant, timeout: Duration) -> bool {
         (self.inbound.is_some() && now.duration_since(self.last_inbound_progress) >= timeout)
-            || (self.outbound.is_some()
+            || (self.outbound.as_ref().is_some_and(|t| t.requested)
                 && now.duration_since(self.last_outbound_progress) >= timeout)
     }
 
@@ -232,7 +246,8 @@ impl FileTransfers {
         paths: Vec<PathBuf>,
         cleanup_directory: Option<PathBuf>,
     ) -> Result<FileTransferMessage> {
-        let transfer = OutboundTransfer::new(transfer_id, paths, cleanup_directory)?;
+        let mut transfer = OutboundTransfer::new(transfer_id, paths, cleanup_directory)?;
+        transfer.requested = !needs_request(purpose, &transfer.files);
         let offer = FileTransferMessage::Offer {
             transfer_id,
             purpose,
@@ -242,6 +257,30 @@ impl FileTransfers {
         self.last_outbound_progress = Instant::now();
         self.outbound = Some(transfer);
         Ok(offer)
+    }
+
+    pub fn deferred_inbound(&self) -> Option<(u64, &[FileMeta])> {
+        self.deferred_inbound
+            .as_ref()
+            .map(|(id, _, files)| (*id, files.as_slice()))
+    }
+
+    pub fn waiting_for_request(&self) -> bool {
+        self.outbound.as_ref().is_some_and(|t| !t.requested) || self.deferred_inbound.is_some()
+    }
+
+    pub fn request_inbound(&mut self, id: u64) -> Result<Option<FileTransferMessage>> {
+        let Some((offer_id, purpose, files)) = self.deferred_inbound.as_ref() else {
+            return Ok(None);
+        };
+        if *offer_id != id {
+            return Ok(None);
+        }
+        let transfer = InboundTransfer::create(&self.root, id, *purpose, files.clone())?;
+        self.inbound = Some(transfer);
+        self.deferred_inbound = None;
+        self.last_inbound_progress = Instant::now();
+        Ok(Some(FileTransferMessage::Request { transfer_id: id }))
     }
 
     pub fn next_outbound(&mut self) -> Result<Option<FileTransferMessage>> {
@@ -267,6 +306,11 @@ impl FileTransfers {
                 }
                 self.cancel_inbound();
                 self.last_inbound_progress = Instant::now();
+                validate_manifest(purpose, &files)?;
+                if needs_request(purpose, &files) {
+                    self.deferred_inbound = Some((transfer_id, purpose, files));
+                    return Ok(None);
+                }
                 self.inbound = Some(InboundTransfer::create(
                     &self.root,
                     transfer_id,
@@ -276,11 +320,7 @@ impl FileTransfers {
                 Ok(None)
             }
             FileTransferMessage::Cancel { transfer_id, .. } => {
-                if self
-                    .inbound
-                    .as_ref()
-                    .is_some_and(|transfer| transfer.id == transfer_id)
-                {
+                if self.inbound_id() == Some(transfer_id) {
                     self.cancel_inbound();
                 }
                 if self
@@ -289,6 +329,23 @@ impl FileTransfers {
                     .is_some_and(|transfer| transfer.id == transfer_id)
                 {
                     self.cancel_outbound("peer cancelled");
+                }
+                Ok(None)
+            }
+            FileTransferMessage::Request { transfer_id } => {
+                if self.retired_outbound.contains(&transfer_id) {
+                    return Ok(None);
+                }
+                let transfer = self
+                    .outbound
+                    .as_mut()
+                    .context("file request without an offer")?;
+                if transfer.id != transfer_id {
+                    bail!("file request does not match offer");
+                }
+                if !transfer.requested {
+                    transfer.requested = true;
+                    self.last_outbound_progress = Instant::now();
                 }
                 Ok(None)
             }
@@ -352,6 +409,7 @@ struct OutboundTransfer {
     offset: u64,
     hasher: Sha256,
     complete_sent: bool,
+    requested: bool,
 }
 
 impl Drop for OutboundTransfer {
@@ -420,10 +478,14 @@ impl OutboundTransfer {
             offset: 0,
             hasher: Sha256::new(),
             complete_sent: false,
+            requested: true,
         })
     }
 
     fn next_message(&mut self) -> Result<Option<FileTransferMessage>> {
+        if !self.requested {
+            return Ok(None);
+        }
         if self.file_index >= self.paths.len() {
             return if self.complete_sent {
                 Ok(None)
@@ -614,6 +676,7 @@ impl InboundTransfer {
                 Ok(true)
             }
             FileTransferMessage::Offer { .. }
+            | FileTransferMessage::Request { .. }
             | FileTransferMessage::Accepted { .. }
             | FileTransferMessage::Cancel { .. } => {
                 bail!("unexpected file-transfer control message")
@@ -630,6 +693,11 @@ impl InboundTransfer {
         }
         Ok(())
     }
+}
+
+fn needs_request(purpose: TransferPurpose, files: &[FileMeta]) -> bool {
+    purpose == TransferPurpose::Files
+        && files.iter().map(|f| f.size).sum::<u64>() >= EAGER_FILE_BYTES
 }
 
 fn validate_manifest(purpose: TransferPurpose, files: &[FileMeta]) -> Result<()> {
@@ -757,6 +825,136 @@ mod tests {
         let path = directory.join(name);
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn eager_threshold_uses_total_bytes_and_excludes_images() {
+        for (sizes, lazy) in [
+            (vec![0], false),
+            (vec![EAGER_FILE_BYTES - 1], false),
+            (vec![EAGER_FILE_BYTES], true),
+            (vec![EAGER_FILE_BYTES + 1], true),
+            (vec![EAGER_FILE_BYTES / 2, EAGER_FILE_BYTES / 2], true),
+        ] {
+            let files = sizes
+                .into_iter()
+                .enumerate()
+                .map(|(i, size)| FileMeta {
+                    name: format!("{i}.bin"),
+                    size,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(needs_request(TransferPurpose::Files, &files), lazy);
+            assert!(!needs_request(TransferPurpose::Image, &files));
+        }
+    }
+
+    #[test]
+    fn large_files_wait_without_io_or_deadline_then_stream_on_request() {
+        let source = temp_file("large.bin", b"start");
+        File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(EAGER_FILE_BYTES)
+            .unwrap();
+        let mut sender = FileTransfers::new("lazy-sender");
+        let mut receiver = FileTransfers::new("lazy-receiver");
+        receiver
+            .receive(sender.begin_outbound(42, vec![source.clone()]).unwrap())
+            .unwrap();
+        assert!(sender.waiting_for_request());
+        assert!(receiver.waiting_for_request());
+        assert!(sender.next_outbound().unwrap().is_none());
+        assert!(sender.outbound.as_ref().unwrap().open_file.is_none());
+        assert!(!receiver.root.exists());
+        let later = Instant::now() + Duration::from_secs(3600);
+        assert!(!sender.expired(later, Duration::from_secs(30)));
+        assert!(!receiver.expired(later, Duration::from_secs(30)));
+        assert!(receiver.request_inbound(41).unwrap().is_none());
+        let request = receiver.request_inbound(42).unwrap().unwrap();
+        sender.receive(request.clone()).unwrap();
+        assert!(!sender.waiting_for_request());
+        assert!(!receiver.waiting_for_request());
+        assert!(receiver.request_inbound(42).unwrap().is_none());
+        assert!(sender.expired(later, Duration::from_secs(30)));
+        assert!(receiver.expired(later, Duration::from_secs(30)));
+        receiver
+            .receive(sender.next_outbound().unwrap().unwrap())
+            .unwrap();
+        // A duplicate request must neither rewind the stream nor extend its deadline.
+        let progress = sender.last_outbound_progress;
+        sender.receive(request).unwrap();
+        assert_eq!(sender.last_outbound_progress, progress);
+        let received = loop {
+            if let Some(received) = receiver
+                .receive(sender.next_outbound().unwrap().unwrap())
+                .unwrap()
+            {
+                break received;
+            }
+        };
+        assert_eq!(
+            std::fs::read(&received.paths[0]).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+        sender
+            .receive(FileTransferMessage::Accepted { transfer_id: 42 })
+            .unwrap();
+        assert!(!sender.has_outbound());
+        std::fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn superseded_lazy_offer_cannot_be_requested() {
+        let source = temp_file("cancel.bin", b"");
+        File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(EAGER_FILE_BYTES)
+            .unwrap();
+        let mut sender = FileTransfers::new("lazy-cancel-sender");
+        let mut receiver = FileTransfers::new("lazy-cancel-receiver");
+        receiver
+            .receive(sender.begin_outbound(1, vec![source.clone()]).unwrap())
+            .unwrap();
+        receiver
+            .receive(sender.cancel_outbound("new copy").unwrap())
+            .unwrap();
+        assert!(receiver.request_inbound(1).unwrap().is_none());
+        sender.begin_outbound(2, vec![source.clone()]).unwrap();
+        sender
+            .receive(FileTransferMessage::Request { transfer_id: 1 })
+            .unwrap();
+        assert_eq!(sender.outbound_id(), Some(2));
+        assert!(sender.next_outbound().unwrap().is_none());
+        assert!(!receiver.root.exists());
+        std::fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn source_changed_while_waiting_is_rejected_when_requested() {
+        let source = temp_file("changed.bin", b"");
+        File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(EAGER_FILE_BYTES)
+            .unwrap();
+        let mut sender = FileTransfers::new("lazy-changed");
+        sender.begin_outbound(1, vec![source.clone()]).unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+        assert!(sender.next_outbound().unwrap().is_none());
+        sender
+            .receive(FileTransferMessage::Request { transfer_id: 1 })
+            .unwrap();
+        assert!(sender
+            .next_outbound()
+            .unwrap_err()
+            .to_string()
+            .contains("changed"));
+        std::fs::remove_dir_all(source.parent().unwrap()).unwrap();
     }
 
     #[test]

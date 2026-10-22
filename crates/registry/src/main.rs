@@ -5,6 +5,7 @@ use clap::Parser;
 use kbshare_net::registry::{serve_http, RegistryStore};
 
 #[derive(Parser, Debug)]
+#[command(version)]
 struct Args {
     #[arg(short, long, default_value = "0.0.0.0:8080")]
     bind: String,

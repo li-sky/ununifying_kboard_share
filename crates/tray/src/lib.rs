@@ -22,11 +22,13 @@ pub const CLIPBOARD_DISCONNECTED: u8 = 1;
 pub const CLIPBOARD_READY: u8 = 2;
 pub const CLIPBOARD_TRANSFERRING: u8 = 3;
 pub const CLIPBOARD_FAILED: u8 = 4;
+pub const CLIPBOARD_AVAILABLE: u8 = 5;
 pub fn clipboard_label(status: u8) -> &'static str {
     match status {
         CLIPBOARD_DISABLED => "Clipboard: disabled",
         CLIPBOARD_READY => "Clipboard: ready",
         CLIPBOARD_TRANSFERRING => "Clipboard: transferring",
+        CLIPBOARD_AVAILABLE => "Clipboard: files available on paste",
         CLIPBOARD_FAILED => "Clipboard: failed (see logs)",
         _ => "Clipboard: disconnected",
     }
