@@ -96,8 +96,8 @@ X11/XWayland 回退。纯 Wayland 下不能把读取全局坐标作为回退方�
 - 对端漏字 → Windows 检查 SendInput extended flag（参见 `is_extended_vk`）。
   Wayland 检查 `RemoteDesktop/libei` 会话是否仍为 active；X11/uinput 回退检查
   `/dev/uinput` 权限和虚拟键盘是否创建成功。
-- 出现乱序 → NDJSON 解码问题，应该不会发生；若复现请把 RUST_LOG=debug
-  打开并抓一份 `[Key ...]` 日志 + 对端的 `inject` 日志。
+- 出现乱序 → 记录两端版本、复现步骤和连接状态；可设置 `RUST_LOG=debug`
+  收集诊断日志。1.0.1 起不记录逐键输入，调试级别也不会输出键码和按键动作。
 
 ## 步骤 4：卡键回归
 

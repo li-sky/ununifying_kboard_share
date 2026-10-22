@@ -149,7 +149,6 @@ impl HostDriver {
 
     pub fn on_local_key(&mut self, action: KeyAction, code: Key) -> Step {
         if self.state.mode() != Mode::Remote {
-            tracing::trace!(?action, code = code.code(), "key swallowed (not Remote)");
             return Step::default();
         }
         // Track for cleanup, but *always* forward the event so that OS-level
@@ -163,7 +162,6 @@ impl HostDriver {
                 let _ = self.pressed.release(code);
             }
         }
-        tracing::debug!(?action, code = code.code(), "forwarding key");
         Step {
             outgoing: vec![Message::Key { action, code }],
             effects: vec![],

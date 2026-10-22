@@ -9,12 +9,12 @@ kbshare 使用 Rust 编写。键盘与剪贴板通过各自独立的 TLS 连接�
 
 ## 下载
 
-当前版本：**1.0.0**。从 [GitHub Releases](https://github.com/li-sky/ununifying_kboard_share/releases/latest) 下载，版本变化见 [CHANGELOG](CHANGELOG.md)。
+当前版本：**1.0.1**。从 [GitHub Releases](https://github.com/li-sky/ununifying_kboard_share/releases/latest) 下载，版本变化见 [CHANGELOG](CHANGELOG.md)。
 
 | 系统 | 下载文件 | 要求 |
 | --- | --- | --- |
-| Windows x64 | `kbshare-v1.0.0-x86_64-pc-windows-msvc.zip` | Windows 桌面环境 |
-| Linux x64 | `kbshare-v1.0.0-x86_64-unknown-linux-gnu.tar.gz` | Ubuntu 24.04 或兼容系统，glibc 2.39+ |
+| Windows x64 | `kbshare-v1.0.1-x86_64-pc-windows-msvc.zip` | Windows 桌面环境 |
+| Linux x64 | `kbshare-v1.0.1-x86_64-unknown-linux-gnu.tar.gz` | Ubuntu 24.04 或兼容系统，glibc 2.39+ |
 
 每个压缩包包含以下程序，以及配置样例和使用文档：
 
@@ -201,4 +201,11 @@ GitHub Actions 在分支推送和 Pull Request 时运行格式检查、Clippy、
 | Logitech 探测不到鼠标 | 鼠标是否唤醒、当前连接通道、接收器 slot、Linux hidraw 权限 |
 | Linux 看不到托盘 | 桌面是否支持 StatusNotifierItem；GNOME 是否启用相应扩展 |
 
-日志通常位于配置文件旁的 `logs/kbshare.log`；使用 `runtime_*` 配置目录时，日志放在它的上一级目录下。可从托盘打开日志目录，或设置 `RUST_LOG=debug` 后重现问题。
+### 日志与保留期限
+
+日志通常位于配置文件旁的 `logs/`；使用 `runtime_*` 配置目录时，日志放在它的上一级目录下。可从托盘打开日志目录。
+
+- 按 **UTC 日期**每天写入一个 `kbshare.YYYY-MM-DD.log` 文件，同一天重启继续追加。
+- 保留当天及前 6 天的日志，启动时及运行期间每分钟清理过期文件；程序空闲时也会清理，关闭期间过期的日志在下次启动时删除。
+- 旧版 `kbshare.log` 不再写入，最后修改时间满 7 天后自动清理；其他文件、目录和符号链接不参与清理。
+- 不记录逐键捕获、转发或注入的键码与动作。`RUST_LOG=debug` / `trace` 仍可用于连接与状态排障，但不会重新开启逐键日志。

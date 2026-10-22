@@ -302,8 +302,7 @@ impl WinKeyInjector {
     }
 
     fn send(&self, key: Key, release: bool) -> Result<()> {
-        let vk = to_win_vk(key)
-            .ok_or_else(|| anyhow!("no Windows VK mapping for key code {}", key.code()))?;
+        let vk = to_win_vk(key).ok_or_else(|| anyhow!("no Windows VK mapping for received key"))?;
         unsafe {
             let scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
             let mut flags: KEYBD_EVENT_FLAGS = 0;

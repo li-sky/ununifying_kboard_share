@@ -297,14 +297,6 @@ impl KeyCapture for LinuxKeyCapture {
                                 };
                                 if let InputEventKind::Key(k) = ev.kind() {
                                     let logical = Key::new(k.code());
-                                    if forwarding.load(Ordering::Relaxed) {
-                                        tracing::info!(
-                                            backend = "evdev",
-                                            ?action,
-                                            keycode = logical.code(),
-                                            "captured Linux key for forwarding"
-                                        );
-                                    }
                                     (on_event.lock())(action, logical);
                                 }
                             }
@@ -571,126 +563,120 @@ async fn run_wayland_input_portal(
     // Every exit path below must fall through to the cleanup after the loop:
     // leaving a capture active keeps the compositor hiding the pointer.
     let result: Result<()> = async {
-    loop {
-        tokio::select! {
-            _ = shutdown_poll.tick() => {
-                if active_capture.is_some() && !hub.should_hold_capture() {
-                    let active = active_capture.take().expect("active capture checked");
-                    if let Err(error) = portal
-                        .release(&session, active.activation_id, active.release_position)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %error,
-                            "releasing Wayland keyboard capture failed; cycling the session"
-                        );
-                        let _ = portal.disable(&session).await;
-                        edges = configure_portal_barriers(&portal, &session).await?;
-                        portal
-                            .enable(&session)
-                            .await
-                            .context("re-enable Wayland input capture after a failed release")?;
-                    }
-                }
-                if hub.shutdown.load(Ordering::Relaxed)
-                    || hub.engine_shutdown.load(Ordering::Relaxed)
-                {
-                    return Ok(());
-                }
-            }
-            activated = activations.next() => {
-                let Some(activated) = activated else {
-                    return Err(anyhow!("Wayland InputCapture activation stream closed"));
-                };
-                let edge = activated
-                    .barrier_id()
-                    .and_then(|id| edges.get(&id).copied());
-                if let Some(edge) = edge {
-                    if let Some(callback) = hub.mouse_callback.lock().clone() {
-                        (callback.lock())(edge.activity());
-                    }
-                    let active = ActiveCapture {
-                        edge,
-                        activation_id: activated.activation_id(),
-                        release_position: edge.release_position(activated.cursor_position()),
-                    };
-                    if hub.should_hold_capture() {
-                        active_capture = Some(active);
-                    } else {
-                        portal
+        loop {
+            tokio::select! {
+                _ = shutdown_poll.tick() => {
+                    if active_capture.is_some() && !hub.should_hold_capture() {
+                        let active = active_capture.take().expect("active capture checked");
+                        if let Err(error) = portal
                             .release(&session, active.activation_id, active.release_position)
                             .await
-                            .context("release unused Wayland input capture")?;
-                    }
-                } else {
-                    tracing::warn!("Wayland InputCapture activated without a known barrier");
-                    portal
-                        .release(&session, activated.activation_id(), None)
-                        .await
-                        .context("release unknown Wayland input capture")?;
-                }
-            }
-            changed = zones_changed.next() => {
-                let Some(_changed) = changed else {
-                    return Err(anyhow!("Wayland InputCapture zone-change stream closed"));
-                };
-                // Explicit Disable also works around portal implementations
-                // that do not suspend the session from SetPointerBarriers.
-                active_capture = None;
-                portal.disable(&session).await.context("disable changed Wayland zones")?;
-                edges = configure_portal_barriers(&portal, &session).await?;
-                portal.enable(&session).await.context("re-enable changed Wayland zones")?;
-            }
-            event = ei_events.next() => {
-                let Some(event) = event else {
-                    return Err(anyhow!("EIS input-capture stream closed"));
-                };
-                match event.context("read captured EIS event")? {
-                    EiEvent::SeatAdded(event) => {
-                        event.seat.bind_capabilities(
-                            DeviceCapability::Keyboard
-                                | DeviceCapability::Pointer
-                                | DeviceCapability::PointerAbsolute
-                                | DeviceCapability::Scroll
-                                | DeviceCapability::Button,
-                        );
-                        context.flush().context("bind EIS input capabilities")?;
-                    }
-                    EiEvent::KeyboardKey(event) => {
-                        let Ok(code) = u16::try_from(event.key) else {
-                            tracing::warn!(keycode = event.key, "ignoring oversized EIS keycode");
-                            continue;
-                        };
-                        let action = match event.state {
-                            ei::keyboard::KeyState::Press => KeyAction::Press,
-                            ei::keyboard::KeyState::Released => KeyAction::Release,
-                        };
-                        if let Some(callback) = hub.key_callback.lock().clone() {
-                            tracing::info!(
-                                backend = "wayland-input-capture",
-                                ?action,
-                                keycode = code,
-                                "captured Linux key for forwarding"
+                        {
+                            tracing::warn!(
+                                error = %error,
+                                "releasing Wayland keyboard capture failed; cycling the session"
                             );
-                            (callback.lock())(action, Key::new(code));
+                            let _ = portal.disable(&session).await;
+                            edges = configure_portal_barriers(&portal, &session).await?;
+                            portal
+                                .enable(&session)
+                                .await
+                                .context("re-enable Wayland input capture after a failed release")?;
                         }
                     }
-                    EiEvent::PointerMotion(event)
-                        if active_capture
-                            .as_ref()
-                            .is_some_and(|active| {
-                                active.edge.is_inward_motion(event.dx, event.dy)
-                            }) =>
+                    if hub.shutdown.load(Ordering::Relaxed)
+                        || hub.engine_shutdown.load(Ordering::Relaxed)
                     {
-                        if let Some(callback) = hub.mouse_callback.lock().clone() {
-                            (callback.lock())(MouseActivity::UNKNOWN);
-                        }
+                        return Ok(());
                     }
-                    _ => {}
+                }
+                activated = activations.next() => {
+                    let Some(activated) = activated else {
+                        return Err(anyhow!("Wayland InputCapture activation stream closed"));
+                    };
+                    let edge = activated
+                        .barrier_id()
+                        .and_then(|id| edges.get(&id).copied());
+                    if let Some(edge) = edge {
+                        if let Some(callback) = hub.mouse_callback.lock().clone() {
+                            (callback.lock())(edge.activity());
+                        }
+                        let active = ActiveCapture {
+                            edge,
+                            activation_id: activated.activation_id(),
+                            release_position: edge.release_position(activated.cursor_position()),
+                        };
+                        if hub.should_hold_capture() {
+                            active_capture = Some(active);
+                        } else {
+                            portal
+                                .release(&session, active.activation_id, active.release_position)
+                                .await
+                                .context("release unused Wayland input capture")?;
+                        }
+                    } else {
+                        tracing::warn!("Wayland InputCapture activated without a known barrier");
+                        portal
+                            .release(&session, activated.activation_id(), None)
+                            .await
+                            .context("release unknown Wayland input capture")?;
+                    }
+                }
+                changed = zones_changed.next() => {
+                    let Some(_changed) = changed else {
+                        return Err(anyhow!("Wayland InputCapture zone-change stream closed"));
+                    };
+                    // Explicit Disable also works around portal implementations
+                    // that do not suspend the session from SetPointerBarriers.
+                    active_capture = None;
+                    portal.disable(&session).await.context("disable changed Wayland zones")?;
+                    edges = configure_portal_barriers(&portal, &session).await?;
+                    portal.enable(&session).await.context("re-enable changed Wayland zones")?;
+                }
+                event = ei_events.next() => {
+                    let Some(event) = event else {
+                        return Err(anyhow!("EIS input-capture stream closed"));
+                    };
+                    match event.context("read captured EIS event")? {
+                        EiEvent::SeatAdded(event) => {
+                            event.seat.bind_capabilities(
+                                DeviceCapability::Keyboard
+                                    | DeviceCapability::Pointer
+                                    | DeviceCapability::PointerAbsolute
+                                    | DeviceCapability::Scroll
+                                    | DeviceCapability::Button,
+                            );
+                            context.flush().context("bind EIS input capabilities")?;
+                        }
+                        EiEvent::KeyboardKey(event) => {
+                            let Ok(code) = u16::try_from(event.key) else {
+                                tracing::warn!("ignoring oversized EIS keycode");
+                                continue;
+                            };
+                            let action = match event.state {
+                                ei::keyboard::KeyState::Press => KeyAction::Press,
+                                ei::keyboard::KeyState::Released => KeyAction::Release,
+                            };
+                            if let Some(callback) = hub.key_callback.lock().clone() {
+                                (callback.lock())(action, Key::new(code));
+                            }
+                        }
+                        EiEvent::PointerMotion(event)
+                            if active_capture
+                                .as_ref()
+                                .is_some_and(|active| {
+                                    active.edge.is_inward_motion(event.dx, event.dy)
+                                }) =>
+                        {
+                            if let Some(callback) = hub.mouse_callback.lock().clone() {
+                                (callback.lock())(MouseActivity::UNKNOWN);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
-    }
     }
     .await;
 

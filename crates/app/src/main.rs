@@ -3,6 +3,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod clipboard;
+mod logging;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -107,7 +108,6 @@ struct RuntimePaths {
     config_path: PathBuf,
     config_dir: PathBuf,
     log_dir: PathBuf,
-    log_file: PathBuf,
 }
 
 trait PeerIo: Read + Write + Send {}
@@ -182,7 +182,7 @@ fn main() -> Result<()> {
     }
     let args = Args::parse();
     let paths = resolve_runtime_paths(&args.config)?;
-    let _log_guard = init_logging(&paths.log_file)?;
+    let _log_guard = logging::init(&paths.log_dir)?;
     if let Err(error) = run(paths) {
         tracing::error!(error = %error, "kbshare exited");
         return Err(error);
@@ -254,7 +254,7 @@ fn run(paths: RuntimePaths) -> Result<()> {
                     if exit_hotkey.observe(action, key) {
                         exit_requested = true;
                         shutdown.store(true, Ordering::Relaxed);
-                        tracing::info!("exit hotkey pressed: Ctrl+Alt+Shift+Pause");
+                        tracing::info!("exit requested by hotkey");
                     }
                 })) {
                     Ok(()) => Some(capture),
@@ -409,7 +409,7 @@ fn run_engine(
             if exit_hotkey.observe(action, key) {
                 exit_requested = true;
                 shutdown.store(true, Ordering::Relaxed);
-                tracing::info!("exit hotkey pressed: Ctrl+Alt+Shift+Pause");
+                tracing::info!("exit requested by hotkey");
                 return;
             }
             let mut guard = slot.lock();
@@ -1209,13 +1209,6 @@ fn send_one(stream: &SharedStream, message: &Message) -> Result<()> {
 
 fn send_host_step(stream: &SharedStream, step: &Step) -> Result<()> {
     for message in &step.outgoing {
-        if let Message::Key { action, code } = message {
-            tracing::info!(
-                ?action,
-                keycode = code.code(),
-                "sending forwarded key to peer"
-            );
-        }
         send_one(stream, message)?;
     }
     Ok(())
@@ -1230,11 +1223,6 @@ fn apply_client_step(
         send_one(stream, message)?;
     }
     for (action, key) in &step.inject {
-        tracing::info!(
-            ?action,
-            keycode = key.code(),
-            "received forwarded key; injecting locally"
-        );
         let mut injector = injector.lock();
         match action {
             kbshare_core::protocol::KeyAction::Press => injector.press(*key)?,
@@ -1341,7 +1329,6 @@ fn resolve_runtime_paths(config_arg: &Path) -> Result<RuntimePaths> {
         config_dir.join("logs")
     };
     Ok(RuntimePaths {
-        log_file: log_dir.join("kbshare.log"),
         config_path,
         config_dir,
         log_dir,
@@ -1368,28 +1355,6 @@ fn load_config(path: &Path) -> Result<Config> {
     }
     let bytes = std::fs::read(path).with_context(|| format!("read config {}", path.display()))?;
     Ok(serde_json::from_slice(&bytes)?)
-}
-
-fn init_logging(log_file: &Path) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    let log_dir = log_file
-        .parent()
-        .ok_or_else(|| anyhow!("missing log directory"))?;
-    std::fs::create_dir_all(log_dir)?;
-    let name = log_file
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("invalid log filename"))?;
-    let appender = tracing_appender::rolling::never(log_dir, name);
-    let (writer, guard) = tracing_appender::non_blocking(appender);
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(writer)
-        .with_ansi(false)
-        .init();
-    Ok(guard)
 }
 
 fn relaunch_with_config(config_path: &Path) -> Result<()> {
@@ -1428,6 +1393,68 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn key_forwarding_and_injection_do_not_log_even_at_trace_level() {
+        use kbshare_core::{keycode::Key, protocol::KeyAction};
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+        let output = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || captured.clone())
+            .finish();
+        let stream: SharedStream =
+            Arc::new(Mutex::new(Box::new(TestPeer(std::io::Cursor::new(vec![])))));
+        let mock = kbshare_platform::mock::MockKeyInjector::new();
+        let injected = mock.log.clone();
+        let injector: SharedInjector = Arc::new(Mutex::new(Box::new(mock)));
+        let mut host = HostDriver::new("alpha", "beta", "fingerprint");
+        let mut client = ClientDriver::new("beta", "alpha", "fingerprint");
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!("logging probe");
+            assert!(!output.lock().is_empty(), "trace capture must be active");
+            output.lock().clear();
+            // Cover local-only input, forwarded press/release and disconnect releases.
+            host.on_local_key(KeyAction::Press, Key::new(30));
+            host.on_session_established();
+            host.on_flow_departure();
+            let steps = [
+                host.on_local_key(KeyAction::Press, Key::new(30)),
+                host.on_local_key(KeyAction::Release, Key::new(30)),
+                host.on_local_key(KeyAction::Press, Key::new(48)),
+                host.on_session_lost(),
+            ];
+            for step in steps {
+                send_host_step(&stream, &step).unwrap();
+                for message in step.outgoing {
+                    apply_client_step(&stream, &injector, &client.on_incoming(message)).unwrap();
+                }
+            }
+            assert!(output.lock().is_empty(), "key path must produce no logs");
+        });
+        assert_eq!(
+            *injected.lock(),
+            vec![
+                (KeyAction::Press, Key::new(30)),
+                (KeyAction::Release, Key::new(30)),
+                (KeyAction::Press, Key::new(48)),
+                (KeyAction::Release, Key::new(48)),
+            ]
+        );
     }
 
     #[test]

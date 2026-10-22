@@ -1410,7 +1410,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kbshare"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1429,6 +1429,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "time",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -1443,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1453,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-flow"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
@@ -1466,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-net"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -1487,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-platform"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -1508,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-registry"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
@@ -1519,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "kbshare-tray"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "image",
